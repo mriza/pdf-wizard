@@ -168,11 +168,23 @@ fn stream_obj(dst: &mut Document, text: String) -> Object {
     Object::Reference(dst.add_object(Stream::new(Dictionary::new(), text.into_bytes())))
 }
 
+/// Maps visual crop margins (relative to the thumbnail rendered with `source_rotate`)
+/// into PDF unrotated edge trims `(left, bottom, right, top)`.
+fn unrotated_crop_trims(c: CropMargins, source_rotate: i64) -> (f32, f32, f32, f32) {
+    match source_rotate.rem_euclid(360) {
+        90 => (c.top, c.left, c.bottom, c.right),
+        180 => (c.right, c.top, c.left, c.bottom),
+        270 => (c.bottom, c.right, c.top, c.left),
+        _ => (c.left, c.bottom, c.right, c.top),
+    }
+}
+
 /// Applies crop, scale and overlays to a page dictionary already copied into the destination document.
 fn apply_transforms(
     dst: &mut Document,
     page: &mut Dictionary,
     item: &PageItem,
+    source_rotate: i64,
     sources: &HashMap<SourceId, SourceDocument>,
     maps: &mut HashMap<SourceId, IdMap>,
 ) -> Result<()> {
@@ -181,8 +193,9 @@ fn apply_transforms(
     let c = item.crop;
     if c != CropMargins::default() {
         let base = cb.unwrap_or(mb);
-        let (w, h) = (mb[2] - mb[0], mb[3] - mb[1]);
-        cb = Some([base[0] + c.left * w, base[1] + c.bottom * h, base[2] - c.right * w, base[3] - c.top * h]);
+        let (w, h) = (base[2] - base[0], base[3] - base[1]);
+        let (tl, tb, tr, tt) = unrotated_crop_trims(c, source_rotate);
+        cb = Some([base[0] + tl * w, base[1] + tb * h, base[2] - tr * w, base[3] - tt * h]);
     }
     let scaled = (item.scale - 1.0).abs() > f32::EPSILON;
     if scaled {
@@ -327,7 +340,7 @@ pub fn export_pages(
         if total != 0 {
             page.set("Rotate", total);
         }
-        apply_transforms(&mut dst, &mut page, item, sources, &mut maps)?;
+        apply_transforms(&mut dst, &mut page, item, rotate, sources, &mut maps)?;
         kids.push(Object::Reference(dst.add_object(page)));
     }
     finish_document(dst, pages_id, kids, meta)
@@ -737,5 +750,34 @@ mod tests {
         let (doc, id) = out_page(&out, 1);
         assert_eq!(doc.get_pages().len(), 4);
         assert_eq!(boxf(doc.get_dictionary(id).unwrap(), b"MediaBox"), vec![0.0, 0.0, 1190.0, 842.0]);
+    }
+
+    #[test]
+    fn export_crop_honors_intrinsic_rotate() {
+        for (rot, expected) in [
+            // Visual top=0.1, visual left=0.2 on MediaBox [0, 0, 595, 842]
+            (90, [59.5, 168.4, 595.0, 842.0]),    // visual top -> x0, visual left -> y0
+            (180, [0.0, 84.2, 476.0, 842.0]),     // visual top -> y0, visual left -> x1
+            (270, [0.0, 0.0, 535.5, 673.6]),      // visual top -> x1, visual left -> y1
+        ] {
+            let mut d = make_doc(1);
+            let pid = *d.get_pages().get(&1).unwrap();
+            d.get_dictionary_mut(pid).unwrap().set("Rotate", rot);
+            let src = sources(to_bytes(d), "a.pdf");
+            let mut it = item(1, 1);
+            it.crop.top = 0.1;
+            it.crop.left = 0.2;
+            let out = export_pages(&[it], &src, &Metadata::default()).unwrap();
+            let (doc, id) = out_page(&out, 1);
+            let cb = boxf(doc.get_dictionary(id).unwrap(), b"CropBox");
+            for k in 0..4 {
+                assert!(
+                    (cb[k] - expected[k]).abs() < 0.1,
+                    "rot={rot} idx={k}: got {}, expected {}",
+                    cb[k],
+                    expected[k]
+                );
+            }
+        }
     }
 }

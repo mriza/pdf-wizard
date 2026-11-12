@@ -22,17 +22,20 @@ pub struct ThumbResult {
     pub image: Option<ThumbImage>,
 }
 
-struct Request {
-    source_id: SourceId,
-    bytes: Arc<Vec<u8>>,
-    page_num: u32,
-    max_px: u32,
+enum WorkerMsg {
+    Render {
+        source_id: SourceId,
+        bytes: Arc<Vec<u8>>,
+        page_num: u32,
+        max_px: u32,
+    },
+    RetainSources(HashSet<SourceId>),
 }
 
 /// Background thumbnail renderer. Render failures (including panics inside the PDF
 /// library) come back as `image: None`; the worker thread keeps running.
 pub struct Renderer {
-    tx: Sender<Request>,
+    tx: Sender<WorkerMsg>,
     rx: Receiver<ThumbResult>,
     inflight: Mutex<HashSet<(SourceId, u32, u32)>>,
 }
@@ -60,18 +63,24 @@ fn render_page(pdf: &Pdf, page_num: u32, max_px: u32) -> Option<ThumbImage> {
     Some(ThumbImage { width: pw, height: ph, rgba: pixmap.data_as_u8_slice().to_vec() })
 }
 
-fn worker(rx: Receiver<Request>, tx: Sender<ThumbResult>) {
+fn worker(rx: Receiver<WorkerMsg>, tx: Sender<ThumbResult>) {
     // Parsed documents are kept per source so each page request does not re-parse the file.
     let mut docs: HashMap<SourceId, Option<Pdf>> = HashMap::new();
-    while let Ok(req) = rx.recv() {
+    while let Ok(msg) = rx.recv() {
+        let WorkerMsg::Render { source_id, bytes, page_num, max_px } = msg else {
+            if let WorkerMsg::RetainSources(keep) = msg {
+                docs.retain(|id, _| keep.contains(id));
+            }
+            continue;
+        };
         let image = catch_unwind(AssertUnwindSafe(|| {
             let pdf = docs
-                .entry(req.source_id)
-                .or_insert_with(|| Pdf::new(req.bytes.clone()).ok());
-            pdf.as_ref().and_then(|p| render_page(p, req.page_num, req.max_px))
+                .entry(source_id)
+                .or_insert_with(|| Pdf::new(bytes.clone()).ok());
+            pdf.as_ref().and_then(|p| render_page(p, page_num, max_px))
         }))
         .unwrap_or(None);
-        let result = ThumbResult { source_id: req.source_id, page_num: req.page_num, image };
+        let result = ThumbResult { source_id, page_num, image };
         if tx.send(result).is_err() {
             break;
         }
@@ -93,7 +102,12 @@ impl Renderer {
         if !self.inflight.lock().unwrap().insert((source_id, page_num, max_px)) {
             return;
         }
-        let _ = self.tx.send(Request { source_id, bytes, page_num, max_px });
+        let _ = self.tx.send(WorkerMsg::Render { source_id, bytes, page_num, max_px });
+    }
+
+    pub fn retain_sources(&self, keep: HashSet<SourceId>) {
+        self.inflight.lock().unwrap().retain(|&(sid, _, _)| keep.contains(&sid));
+        let _ = self.tx.send(WorkerMsg::RetainSources(keep));
     }
 
     pub fn poll(&self) -> Vec<ThumbResult> {

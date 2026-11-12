@@ -97,9 +97,8 @@ fn is_pdf(p: &Path) -> bool {
 }
 
 impl PdfWizardApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let mut app = PdfWizardApp {
+    fn empty() -> Self {
+        PdfWizardApp {
             sources: HashMap::new(),
             next_source: 0,
             next_uid: 0,
@@ -120,7 +119,12 @@ impl PdfWizardApp {
             scale_edit: 100.0,
             dragging: false,
             drop_target: None,
-        };
+        }
+    }
+
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut app = Self::empty();
         let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
         if !args.is_empty() {
             let loaded = app.load_paths(&args);
@@ -140,6 +144,7 @@ impl PdfWizardApp {
         self.pages = pages;
         self.history.push(self.pages.clone());
         self.selected.retain(|&i| i < self.pages.len());
+        self.anchor = self.anchor.filter(|&a| a < self.pages.len());
     }
 
     fn sel_vec(&self) -> Vec<usize> {
@@ -152,8 +157,34 @@ impl PdfWizardApp {
 
     fn select_only(&mut self, i: usize) {
         self.selected.clear();
-        self.selected.insert(i);
-        self.anchor = Some(i);
+        if i < self.pages.len() {
+            self.selected.insert(i);
+            self.anchor = Some(i);
+        } else {
+            self.anchor = None;
+        }
+    }
+
+    fn handle_card_click(&mut self, i: usize, shift: bool, command: bool) {
+        if i >= self.pages.len() {
+            return;
+        }
+        match (shift, command, self.anchor) {
+            (true, _, Some(anchor)) => {
+                let max_idx = self.pages.len().saturating_sub(1);
+                self.selected = apply_range_select(anchor.min(max_idx), i)
+                    .into_iter()
+                    .filter(|&idx| idx < self.pages.len())
+                    .collect();
+            }
+            (_, true, _) => {
+                if !self.selected.remove(&i) {
+                    self.selected.insert(i);
+                }
+                self.anchor = Some(i);
+            }
+            _ => self.select_only(i),
+        }
     }
 
     /// Loads PDFs and images; never changes workspace state on failure. Errors go to the status bar.
@@ -243,6 +274,9 @@ impl PdfWizardApp {
             }
             let table = [
                 (cmd, Key::A, Action::SelectAll),
+                (cmd, Key::C, Action::Copy),
+                (cmd, Key::X, Action::Cut),
+                (cmd, Key::V, Action::PasteAfter),
                 (cmd, Key::D, Action::Duplicate),
                 (cmd, Key::O, Action::Open),
                 (cmd, Key::S, Action::Save),
@@ -259,9 +293,15 @@ impl PdfWizardApp {
             }
             for e in &i.events {
                 match e {
-                    egui::Event::Copy => actions.push(Action::Copy),
-                    egui::Event::Cut => actions.push(Action::Cut),
-                    egui::Event::Paste(_) => actions.push(Action::PasteAfter),
+                    egui::Event::Copy if !actions.iter().any(|a| matches!(a, Action::Copy)) => {
+                        actions.push(Action::Copy);
+                    }
+                    egui::Event::Cut if !actions.iter().any(|a| matches!(a, Action::Cut)) => {
+                        actions.push(Action::Cut);
+                    }
+                    egui::Event::Paste(_) if !actions.iter().any(|a| matches!(a, Action::PasteAfter)) => {
+                        actions.push(Action::PasteAfter);
+                    }
                     _ => {}
                 }
             }
@@ -359,20 +399,26 @@ impl PdfWizardApp {
             Action::Copy => {
                 if has_sel {
                     self.clipboard = self.selected_items();
+                    ctx.copy_text("pdf-wizard-pages".into());
                     self.status = format!("Copied {} page(s)", self.clipboard.len());
+                } else {
+                    self.status = "No pages selected".into();
                 }
             }
             Action::Cut => {
                 if has_sel {
                     self.clipboard = self.selected_items();
+                    ctx.copy_text("pdf-wizard-pages".into());
                     self.delete_selected();
+                } else {
+                    self.status = "No pages selected".into();
                 }
             }
             Action::PasteAfter => {
                 if self.clipboard.is_empty() {
                     self.status = "Clipboard is empty".into();
                 } else {
-                    let at = self.selected.iter().next_back().map_or(self.pages.len(), |&i| i + 1);
+                    let at = self.selected.iter().next_back().map_or(self.pages.len(), |&i| i + 1).min(self.pages.len());
                     let clones: Vec<PageItem> = self.clipboard.clone().into_iter().map(|p| self.renumber(p)).collect();
                     let mut pages = self.pages.clone();
                     let n = clones.len();
@@ -391,7 +437,9 @@ impl PdfWizardApp {
                     (Some((sid, num)), true) => {
                         let mut pages = self.pages.clone();
                         for &i in &self.selected {
-                            pages[i].overlays.push(OverlaySpec { source_id: sid, page_number: num, is_underlay: under });
+                            if let Some(p) = pages.get_mut(i) {
+                                p.overlays.push(OverlaySpec { source_id: sid, page_number: num, is_underlay: under });
+                            }
                         }
                         self.commit(pages);
                         self.status = "Overlay applied".into();
@@ -414,11 +462,15 @@ impl PdfWizardApp {
                     self.commit(pages);
                     self.selected = new_sel;
                     self.status = "Duplicated".into();
+                } else {
+                    self.status = "No pages selected".into();
                 }
             }
             Action::Delete => {
                 if has_sel {
                     self.delete_selected();
+                } else {
+                    self.status = "No pages selected".into();
                 }
             }
             Action::InsertBlank => {
@@ -466,7 +518,7 @@ impl PdfWizardApp {
             Action::Reverse => {
                 let mut pages = self.pages.clone();
                 if self.selected.len() >= 2 {
-                    let idx = self.sel_vec();
+                    let idx: Vec<usize> = self.sel_vec().into_iter().filter(|&i| i < pages.len()).collect();
                     let mut chosen: Vec<PageItem> = idx.iter().map(|&i| pages[i].clone()).collect();
                     chosen.reverse();
                     for (k, &i) in idx.iter().enumerate() {
@@ -509,6 +561,11 @@ impl PdfWizardApp {
             self.history = History::new(self.pages.clone());
             self.selected.clear();
             self.anchor = None;
+            let keep: std::collections::HashSet<SourceId> =
+                self.pages.iter().filter_map(|p| p.source_id).collect();
+            self.sources.retain(|id, _| keep.contains(id));
+            self.thumbs.retain(|(id, _), _| keep.contains(id));
+            self.renderer.retain_sources(keep);
         } else {
             let mut pages = self.pages.clone();
             pages.extend(loaded);
@@ -519,6 +576,7 @@ impl PdfWizardApp {
     fn restore(&mut self, pages: Vec<PageItem>, msg: &str) {
         self.pages = pages;
         self.selected.clear();
+        self.anchor = None;
         self.status = msg.into();
     }
 
@@ -532,6 +590,7 @@ impl PdfWizardApp {
             .collect();
         let n = self.selected.len();
         self.selected.clear();
+        self.anchor = None;
         self.commit(pages);
         self.status = format!("Removed {n} page(s)");
     }
@@ -543,7 +602,9 @@ impl PdfWizardApp {
         }
         let mut pages = self.pages.clone();
         for &i in &self.selected {
-            pages[i].rotate(delta);
+            if let Some(p) = pages.get_mut(i) {
+                p.rotate(delta);
+            }
         }
         self.commit(pages);
     }
@@ -577,8 +638,10 @@ impl PdfWizardApp {
         let crop = CropMargins { left: l, right: r, top: t, bottom: b };
         let mut pages = self.pages.clone();
         for &i in &self.selected {
-            pages[i].crop = crop;
-            pages[i].scale = self.scale_edit / 100.0;
+            if let Some(p) = pages.get_mut(i) {
+                p.crop = crop;
+                p.scale = self.scale_edit / 100.0;
+            }
         }
         self.commit(pages);
         self.status = "Crop and scale applied".into();
@@ -816,16 +879,7 @@ impl PdfWizardApp {
 
         if resp.clicked() {
             let m = ui.input(|inp| inp.modifiers);
-            match (m.shift, m.command, self.anchor) {
-                (true, _, Some(anchor)) => self.selected = apply_range_select(anchor, i).into_iter().collect(),
-                (_, true, _) => {
-                    if !self.selected.remove(&i) {
-                        self.selected.insert(i);
-                    }
-                    self.anchor = Some(i);
-                }
-                _ => self.select_only(i),
-            }
+            self.handle_card_click(i, m.shift, m.command);
         }
         if resp.secondary_clicked() && !self.selected.contains(&i) {
             self.select_only(i);
@@ -963,5 +1017,78 @@ mod tests {
         assert_eq!(apply_range_select(2, 5), vec![2, 3, 4, 5]);
         assert_eq!(apply_range_select(5, 2), vec![2, 3, 4, 5]);
         assert_eq!(apply_range_select(3, 3), vec![3]);
+    }
+
+    #[test]
+    fn shift_click_after_delete_never_selects_oob_or_panics() {
+        let mut app = PdfWizardApp::empty();
+        let pages: Vec<PageItem> = (0..10).map(|i| pdf_engine::blank_page(i, A4_W, A4_H)).collect();
+        app.commit(pages);
+        app.handle_card_click(8, false, false);
+        app.selected = (4..10).collect();
+        app.delete_selected();
+        assert_eq!(app.pages.len(), 4);
+        app.handle_card_click(1, true, false);
+        assert!(app.selected.iter().all(|&idx| idx < app.pages.len()));
+        app.rotate_selected(90);
+    }
+
+    #[test]
+    fn empty_selection_actions_set_status_message() {
+        let mut app = PdfWizardApp::empty();
+        app.commit(vec![pdf_engine::blank_page(1, A4_W, A4_H)]);
+        let ctx = egui::Context::default();
+        for act in [Action::Delete, Action::Cut, Action::Copy] {
+            app.status.clear();
+            app.run(act, &ctx);
+            assert_eq!(app.status, "No pages selected");
+        }
+        assert_eq!(app.pages.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_v_pastes_internal_clipboard_without_os_paste_event() {
+        let mut app = PdfWizardApp::empty();
+        app.commit(vec![pdf_engine::blank_page(1, A4_W, A4_H)]);
+        app.select_only(0);
+        let ctx = egui::Context::default();
+        app.run(Action::Copy, &ctx);
+        assert_eq!(app.clipboard.len(), 1);
+
+        let mut actions = Vec::new();
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        });
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.handle_input(ui.ctx(), &mut actions);
+        });
+        out.textures_delta.clear();
+        assert!(actions.iter().any(|a| matches!(a, Action::PasteAfter)));
+    }
+
+    #[test]
+    fn open_replace_prunes_stale_sources_and_thumbs() {
+        let mut app = PdfWizardApp::empty();
+        let dir = std::env::temp_dir().join(format!("pdfwiz_app_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("one.pdf");
+        let f2 = dir.join("two.pdf");
+        std::fs::write(&f1, pdf_engine::testutil::make_pdf(2)).unwrap();
+        std::fs::write(&f2, pdf_engine::testutil::make_pdf(1)).unwrap();
+
+        app.add_loaded(&[f1], true);
+        assert_eq!(app.sources.len(), 1);
+        app.thumbs.insert((0, 1), Thumb::Loading);
+
+        app.add_loaded(&[f2], true);
+        assert_eq!(app.sources.len(), 1);
+        assert!(!app.sources.contains_key(&0));
+        assert!(!app.thumbs.contains_key(&(0, 1)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
