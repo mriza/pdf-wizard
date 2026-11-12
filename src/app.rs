@@ -100,6 +100,7 @@ enum Action {
     StepRight,
     ToggleSelectMode,
     ToggleReorderMode,
+    ToggleTools,
 }
 
 pub struct PdfWizardApp {
@@ -121,6 +122,7 @@ pub struct PdfWizardApp {
     meta: Metadata,
     show_meta: bool,
     show_crop: bool,
+    show_tools: bool,
     crop_edit: [f32; 4],
     scale_edit: f32,
     dragging: bool,
@@ -205,6 +207,7 @@ impl PdfWizardApp {
             meta: Metadata::default(),
             show_meta: false,
             show_crop: false,
+            show_tools: false,
             crop_edit: [0.0; 4],
             scale_edit: 100.0,
             dragging: false,
@@ -644,6 +647,9 @@ impl PdfWizardApp {
                     "Reorder mode OFF: drag ⋮⋮ handle to move, swipe cards to scroll".into()
                 };
             }
+            Action::ToggleTools => {
+                self.show_tools = !self.show_tools;
+            }
         }
     }
 
@@ -875,46 +881,96 @@ impl PdfWizardApp {
             ant_btn(ui, t, true, "Reorder", reo_kind, || a.push(Action::ToggleReorderMode));
             ui.separator();
             ant_btn(ui, t, !self.pages.is_empty(), "Save", BtnKind::Primary, || a.push(Action::Save));
-            ui.menu_button("More", |ui| {
-                egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
-                    ui.label("Files & Pages");
-                    mi(ui, a, "Import Image(s)...", "", Action::ImportImages);
-                    mi(ui, a, "Insert Blank Page", "", Action::InsertBlank);
-                    mi(ui, a, "Split All Pages to Folder...", "", Action::SplitAll);
-                    mi(ui, a, "Generate Booklet...", "", Action::Booklet);
-                    mi(ui, a, "Edit Metadata...", "", Action::Metadata);
-                    ui.separator();
-                    ui.label("Selection");
-                    mi(ui, a, "Select All", "Ctrl+A", Action::SelectAll);
-                    mi(ui, a, "Deselect All", "", Action::SelectNone);
-                    mi(ui, a, "Invert Selection", "", Action::Invert);
-                    mi(ui, a, "Select Odd Pages", "", Action::SelectOdd);
-                    mi(ui, a, "Select Even Pages", "", Action::SelectEven);
-                    mi(ui, a, "Select Same Source", "", Action::SelectSame);
-                    ui.separator();
-                    ui.label("Clipboard & Arrange");
-                    mi(ui, a, "Copy", "Ctrl+C", Action::Copy);
-                    mi(ui, a, "Cut", "Ctrl+X", Action::Cut);
-                    mi(ui, a, "Paste After", "Ctrl+V", Action::PasteAfter);
-                    mi(ui, a, "Paste as Overlay", "", Action::PasteOverlay);
-                    mi(ui, a, "Paste as Underlay", "", Action::PasteUnderlay);
-                    mi(ui, a, "Rotate 180", "", Action::Rotate180);
-                    mi(ui, a, "Reverse Order", "", Action::Reverse);
-                    mi(ui, a, "Swap Odd/Even Pages", "", Action::SwapOddEven);
-                    ui.separator();
-                    ui.label("Zoom & Theme");
-                    ui.horizontal(|ui| {
-                        ant_btn(ui, t, true, " - ", BtnKind::Default, || a.push(Action::ZoomOut));
-                        ant_btn(ui, t, true, "Reset", BtnKind::Default, || a.push(Action::ZoomReset));
-                        ant_btn(ui, t, true, " + ", BtnKind::Default, || a.push(Action::ZoomIn));
-                    });
-                    ui.add(egui::Slider::new(&mut self.zoom, 80.0..=400.0).show_value(false));
-                    let theme_lbl = if self.dark { "Switch to Light Theme" } else { "Switch to Dark Theme" };
-                    mi(ui, a, theme_lbl, "", Action::ToggleTheme);
-                    ui.separator();
-                    mi(ui, a, "Quit", "", Action::Quit);
+            let tools_kind = if self.show_tools { BtnKind::Active } else { BtnKind::Default };
+            ant_btn(ui, t, true, "Tools", tools_kind, || a.push(Action::ToggleTools));
+        });
+    }
+
+    fn tools_panel(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        let t = AntTokens::for_mode(self.dark);
+        ui.horizontal(|ui| {
+            ui.strong(egui::RichText::new("Tools").color(t.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ant_btn_sized(ui, t, [36.0, 36.0], true, "X", BtnKind::Default, || {
+                    a.push(Action::ToggleTools);
                 });
             });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let w = ui.available_width();
+            let section = |ui: &mut egui::Ui, title: &str| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(title).small().strong().color(t.text_secondary));
+            };
+
+            section(ui, "Files & Pages");
+            side_btn(ui, t, w, true, "Import Image(s)...", BtnKind::Default, || a.push(Action::ImportImages));
+            side_btn(ui, t, w, true, "Insert Blank Page", BtnKind::Default, || a.push(Action::InsertBlank));
+            side_btn(ui, t, w, !self.pages.is_empty(), "Split All Pages to Folder...", BtnKind::Default, || {
+                a.push(Action::SplitAll);
+            });
+            side_btn(ui, t, w, !self.pages.is_empty(), "Generate Booklet...", BtnKind::Default, || {
+                a.push(Action::Booklet);
+            });
+            side_btn(ui, t, w, true, "Edit Metadata...", BtnKind::Default, || a.push(Action::Metadata));
+
+            ui.separator();
+            section(ui, "Selection");
+            side_btn(ui, t, w, !self.pages.is_empty(), "Select All (Ctrl+A)", BtnKind::Default, || {
+                a.push(Action::SelectAll);
+            });
+            side_btn(ui, t, w, !self.selected.is_empty(), "Deselect All", BtnKind::Default, || {
+                a.push(Action::SelectNone);
+            });
+            side_btn(ui, t, w, !self.pages.is_empty(), "Invert Selection", BtnKind::Default, || {
+                a.push(Action::Invert);
+            });
+            side_btn(ui, t, w, !self.pages.is_empty(), "Select Odd Pages", BtnKind::Default, || {
+                a.push(Action::SelectOdd);
+            });
+            side_btn(ui, t, w, !self.pages.is_empty(), "Select Even Pages", BtnKind::Default, || {
+                a.push(Action::SelectEven);
+            });
+            side_btn(ui, t, w, !self.selected.is_empty(), "Select Same Source", BtnKind::Default, || {
+                a.push(Action::SelectSame);
+            });
+
+            ui.separator();
+            section(ui, "Clipboard & Arrange");
+            side_btn(ui, t, w, !self.selected.is_empty(), "Copy (Ctrl+C)", BtnKind::Default, || a.push(Action::Copy));
+            side_btn(ui, t, w, !self.selected.is_empty(), "Cut (Ctrl+X)", BtnKind::Default, || a.push(Action::Cut));
+            side_btn(ui, t, w, !self.clipboard.is_empty(), "Paste After (Ctrl+V)", BtnKind::Default, || {
+                a.push(Action::PasteAfter);
+            });
+            side_btn(ui, t, w, !self.clipboard.is_empty() && !self.selected.is_empty(), "Paste as Overlay", BtnKind::Default, || {
+                a.push(Action::PasteOverlay);
+            });
+            side_btn(ui, t, w, !self.clipboard.is_empty() && !self.selected.is_empty(), "Paste as Underlay", BtnKind::Default, || {
+                a.push(Action::PasteUnderlay);
+            });
+            side_btn(ui, t, w, !self.selected.is_empty(), "Rotate 180", BtnKind::Default, || {
+                a.push(Action::Rotate180);
+            });
+            side_btn(ui, t, w, self.pages.len() >= 2, "Reverse Order", BtnKind::Default, || a.push(Action::Reverse));
+            side_btn(ui, t, w, self.pages.len() >= 2, "Swap Odd/Even Pages", BtnKind::Default, || {
+                a.push(Action::SwapOddEven);
+            });
+
+            ui.separator();
+            section(ui, "Zoom & Theme");
+            ui.horizontal(|ui| {
+                let bw = ((w - 16.0) / 3.0).max(50.0);
+                ant_btn_sized(ui, t, [bw, TOUCH_HEIGHT], true, "-", BtnKind::Default, || a.push(Action::ZoomOut));
+                ant_btn_sized(ui, t, [bw, TOUCH_HEIGHT], true, "Reset", BtnKind::Default, || a.push(Action::ZoomReset));
+                ant_btn_sized(ui, t, [bw, TOUCH_HEIGHT], true, "+", BtnKind::Default, || a.push(Action::ZoomIn));
+            });
+            ui.add(egui::Slider::new(&mut self.zoom, 80.0..=400.0).show_value(false));
+            let theme_lbl = if self.dark { "Switch to Light Theme" } else { "Switch to Dark Theme" };
+            side_btn(ui, t, w, true, theme_lbl, BtnKind::Default, || a.push(Action::ToggleTheme));
+
+            ui.separator();
+            side_btn(ui, t, w, true, "Quit", BtnKind::Danger, || a.push(Action::Quit));
         });
     }
 
@@ -927,14 +983,12 @@ impl PdfWizardApp {
             ant_btn(ui, t, true, "<", BtnKind::Default, || a.push(Action::StepLeft));
             ant_btn(ui, t, true, ">", BtnKind::Default, || a.push(Action::StepRight));
             ui.separator();
-            ant_btn(ui, t, true, "Rotate L", BtnKind::Default, || a.push(Action::RotateLeft));
-            ant_btn(ui, t, true, "Rotate R", BtnKind::Default, || a.push(Action::RotateRight));
+            ant_btn(ui, t, true, "<- Rotate", BtnKind::Default, || a.push(Action::RotateLeft));
+            ant_btn(ui, t, true, "Rotate ->", BtnKind::Default, || a.push(Action::RotateRight));
             ant_btn(ui, t, true, "Crop", BtnKind::Default, || a.push(Action::CropDialog));
             ant_btn(ui, t, true, "Dup", BtnKind::Default, || a.push(Action::Duplicate));
-            ui.menu_button("Extract", |ui| {
-                mi(ui, a, "Single PDF...", "", Action::ExtractSingle);
-                mi(ui, a, "Separate PDFs...", "", Action::ExtractSeparate);
-            });
+            ant_btn(ui, t, true, "Extract PDF", BtnKind::Default, || a.push(Action::ExtractSingle));
+            ant_btn(ui, t, true, "Split Sel", BtnKind::Default, || a.push(Action::ExtractSeparate));
             ant_btn(ui, t, true, "Delete", BtnKind::Danger, || a.push(Action::Delete));
             ant_btn(ui, t, true, "Clear", BtnKind::Default, || a.push(Action::SelectNone));
         });
@@ -1320,6 +1374,18 @@ fn ant_btn_sized(
     }
 }
 
+fn side_btn(
+    ui: &mut egui::Ui,
+    t: AntTokens,
+    width: f32,
+    enabled: bool,
+    label: &str,
+    kind: BtnKind,
+    on_click: impl FnOnce(),
+) {
+    ant_btn_sized(ui, t, [width, TOUCH_HEIGHT], enabled, label, kind, on_click);
+}
+
 fn mi(ui: &mut egui::Ui, a: &mut Vec<Action>, label: &str, shortcut: &str, act: Action) {
     let mut button = egui::Button::new(label).min_size(Vec2::new(220.0, 42.0));
     if !shortcut.is_empty() {
@@ -1342,6 +1408,12 @@ impl eframe::App for PdfWizardApp {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if !self.selected.is_empty() {
             egui::Panel::bottom("selection_bar").show(ui, |ui| self.selection_bar(ui, &mut actions));
+        }
+        if self.show_tools {
+            egui::Panel::right("tools_panel")
+                .resizable(false)
+                .default_size(270.0)
+                .show(ui, |ui| self.tools_panel(ui, &mut actions));
         }
         egui::CentralPanel::default().show(ui, |ui| self.grid(ui, &mut actions));
         self.dialogs(&ctx);
@@ -1543,5 +1615,16 @@ mod tests {
         assert!(ctx.global_style().visuals.dark_mode);
         assert_eq!(ctx.global_style().visuals.panel_fill, AntTokens::dark().bg_layout);
         assert!(ctx.global_style().spacing.interact_size.y >= 44.0);
+    }
+
+    #[test]
+    fn toggle_tools_toggles_side_panel() {
+        let mut app = PdfWizardApp::empty();
+        let ctx = egui::Context::default();
+        assert!(!app.show_tools);
+        app.run(Action::ToggleTools, &ctx);
+        assert!(app.show_tools);
+        app.run(Action::ToggleTools, &ctx);
+        assert!(!app.show_tools);
     }
 }
