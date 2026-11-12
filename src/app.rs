@@ -11,6 +11,28 @@ use std::time::Duration;
 const THUMB_PX: u32 = 360;
 const SPACING: f32 = 14.0;
 const TOUCH_HEIGHT: f32 = 44.0;
+const CARD_HEADER_H: f32 = 40.0;
+const CARD_BTN_H: f32 = 36.0;
+
+fn card_header_text(index: usize, item: &PageItem, card_width: f32) -> String {
+    if card_width < 130.0 {
+        return format!("#{}", index + 1);
+    }
+    let mut tags = String::new();
+    if item.rotation != 0 {
+        tags += &format!(" R{}", item.rotation);
+    }
+    if item.crop != CropMargins::default() {
+        tags += " crop";
+    }
+    if (item.scale - 1.0).abs() > f32::EPSILON {
+        tags += &format!(" {:.0}%", item.scale * 100.0);
+    }
+    if !item.overlays.is_empty() {
+        tags += " ovl";
+    }
+    format!("#{}{}", index + 1, tags)
+}
 
 /// Configures generous spacing, hit targets, and scrollbars for touchscreen use.
 pub fn apply_touch_style(ctx: &egui::Context) {
@@ -868,14 +890,14 @@ impl PdfWizardApp {
         let item = self.pages[i].clone();
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let selected = self.selected.contains(&i);
-        let header_h = 38.0;
+        let header_h = CARD_HEADER_H;
         let footer_h = 24.0;
         let btn_w = (size.x * 0.34).clamp(32.0, 40.0);
 
-        let check_rect = Rect::from_min_size(rect.min + Vec2::splat(4.0), Vec2::new(btn_w, header_h - 4.0));
+        let check_rect = Rect::from_min_size(rect.min + Vec2::new(4.0, 2.0), Vec2::new(btn_w, CARD_BTN_H));
         let handle_rect = Rect::from_min_size(
-            egui::pos2(rect.right() - btn_w - 4.0, rect.top() + 4.0),
-            Vec2::new(btn_w, header_h - 4.0),
+            egui::pos2(rect.right() - btn_w - 4.0, rect.top() + 2.0),
+            Vec2::new(btn_w, CARD_BTN_H),
         );
         let body_rect = Rect::from_min_max(
             egui::pos2(rect.left(), rect.top() + header_h),
@@ -936,24 +958,11 @@ impl PdfWizardApp {
                 visuals.text_color(),
             );
 
-            // Top-center page number & transform tags
-            let mut tags = String::new();
-            if item.rotation != 0 {
-                tags += &format!(" R{}", item.rotation);
-            }
-            if item.crop != CropMargins::default() {
-                tags += " crop";
-            }
-            if (item.scale - 1.0).abs() > f32::EPSILON {
-                tags += &format!(" {:.0}%", item.scale * 100.0);
-            }
-            if !item.overlays.is_empty() {
-                tags += " ovl";
-            }
-            painter.text(
+            // Top-center page number & transform tags (clipped to avoid overlapping side buttons)
+            painter.with_clip_rect(title_rect).text(
                 title_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("#{}{}", i + 1, tags),
+                card_header_text(i, &item, size.x),
                 egui::FontId::proportional(12.5),
                 visuals.text_color(),
             );
@@ -1306,5 +1315,19 @@ mod tests {
         let s = ctx.global_style();
         assert!(s.spacing.interact_size.y >= 44.0);
         assert!(s.spacing.scroll.bar_width >= 12.0);
+    }
+
+    #[test]
+    fn card_header_text_compacts_at_low_zoom() {
+        let mut item = pdf_engine::blank_page(1, A4_W, A4_H);
+        item.rotate(90);
+        item.crop.left = 0.1;
+        assert_eq!(card_header_text(0, &item, 80.0), "#1");
+        assert_eq!(card_header_text(0, &item, 190.0), "#1 R90 crop");
+    }
+
+    #[test]
+    fn card_touch_target_meets_36px_minimum() {
+        assert!(CARD_BTN_H >= 36.0);
     }
 }
