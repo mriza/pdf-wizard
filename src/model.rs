@@ -55,6 +55,22 @@ impl PageItem {
         }
     }
 
+    pub fn from_source(
+        uid: u64,
+        source_id: SourceId,
+        page_num: u32,
+        width_pt: f32,
+        height_pt: f32,
+        label: String,
+    ) -> Self {
+        PageItem {
+            source_id: Some(source_id),
+            source_page_num: page_num,
+            label,
+            ..PageItem::blank(uid, width_pt, height_pt)
+        }
+    }
+
     pub fn rotate(&mut self, delta: i32) {
         self.rotation = (self.rotation + delta).rem_euclid(360);
     }
