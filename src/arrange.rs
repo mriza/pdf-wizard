@@ -21,7 +21,7 @@ pub fn reverse(pages: &mut [PageItem]) {
 
 /// Swaps pages 1<->2, 3<->4, ...; a trailing odd page stays in place.
 pub fn swap_odd_even(pages: &mut [PageItem]) {
-    for pair in pages.chunks_exact_mut(2) {
+    for pair in pages.as_chunks_mut::<2>().0 {
         pair.swap(0, 1);
     }
 }
