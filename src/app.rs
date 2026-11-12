@@ -3,14 +3,14 @@ use crate::history::History;
 use crate::model::{CropMargins, Metadata, OverlaySpec, PageItem, SourceId};
 use crate::pdf_engine::{self, SourceDocument, A4_H, A4_W};
 use crate::renderer::Renderer;
+use crate::theme::{self, AntTokens, BtnKind, TOUCH_HEIGHT};
 use eframe::egui::{self, Key, Modifiers, Rect, Sense, Vec2};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const THUMB_PX: u32 = 360;
-const SPACING: f32 = 14.0;
-const TOUCH_HEIGHT: f32 = 44.0;
+const SPACING: f32 = 16.0;
 const CARD_HEADER_H: f32 = 40.0;
 const CARD_BTN_H: f32 = 36.0;
 
@@ -35,16 +35,9 @@ fn card_header_text(index: usize, item: &PageItem, card_width: f32) -> String {
 }
 
 /// Configures generous spacing, hit targets, and scrollbars for touchscreen use.
+#[cfg(test)]
 pub fn apply_touch_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|s| {
-        s.spacing.interact_size = Vec2::new(TOUCH_HEIGHT, TOUCH_HEIGHT);
-        s.spacing.button_padding = Vec2::new(14.0, 10.0);
-        s.spacing.item_spacing = Vec2::new(10.0, 10.0);
-        s.spacing.slider_width = 180.0;
-        s.spacing.slider_rail_height = 14.0;
-        s.spacing.scroll.bar_width = 14.0;
-        s.spacing.scroll.handle_min_length = TOUCH_HEIGHT;
-    });
+    theme::apply_ant_theme(ctx, true);
 }
 
 /// Number of thumbnail columns that fit in `avail_width` (at least 1).
@@ -222,9 +215,8 @@ impl PdfWizardApp {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        apply_touch_style(&cc.egui_ctx);
         let mut app = Self::empty();
+        theme::apply_ant_theme(&cc.egui_ctx, app.dark);
         let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
         if !args.is_empty() {
             let loaded = app.load_paths(&args);
@@ -632,8 +624,7 @@ impl PdfWizardApp {
             Action::ZoomReset => self.zoom = 190.0,
             Action::ToggleTheme => {
                 self.dark = !self.dark;
-                ctx.set_visuals(if self.dark { egui::Visuals::dark() } else { egui::Visuals::light() });
-                apply_touch_style(ctx);
+                theme::apply_ant_theme(ctx, self.dark);
             }
             Action::StepLeft => self.step_move_selected(-1),
             Action::StepRight => self.step_move_selected(1),
@@ -870,17 +861,20 @@ impl PdfWizardApp {
     // -------------------------------------------------------------------- UI
 
     fn top_bar(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        let t = AntTokens::for_mode(self.dark);
         ui.horizontal_wrapped(|ui| {
-            touch_btn(ui, true, "+ Open", false, || a.push(Action::Open));
-            touch_btn(ui, true, "Append", false, || a.push(Action::Append));
+            ant_btn(ui, t, true, "+ Open", BtnKind::Default, || a.push(Action::Open));
+            ant_btn(ui, t, true, "Append", BtnKind::Default, || a.push(Action::Append));
             ui.separator();
-            touch_btn(ui, true, "Undo", false, || a.push(Action::Undo));
-            touch_btn(ui, true, "Redo", false, || a.push(Action::Redo));
+            ant_btn(ui, t, true, "Undo", BtnKind::Default, || a.push(Action::Undo));
+            ant_btn(ui, t, true, "Redo", BtnKind::Default, || a.push(Action::Redo));
             ui.separator();
-            touch_btn(ui, true, "Select", self.select_mode, || a.push(Action::ToggleSelectMode));
-            touch_btn(ui, true, "Reorder", self.reorder_mode, || a.push(Action::ToggleReorderMode));
+            let sel_kind = if self.select_mode { BtnKind::Active } else { BtnKind::Default };
+            let reo_kind = if self.reorder_mode { BtnKind::Active } else { BtnKind::Default };
+            ant_btn(ui, t, true, "Select", sel_kind, || a.push(Action::ToggleSelectMode));
+            ant_btn(ui, t, true, "Reorder", reo_kind, || a.push(Action::ToggleReorderMode));
             ui.separator();
-            touch_btn(ui, !self.pages.is_empty(), "Save", false, || a.push(Action::Save));
+            ant_btn(ui, t, !self.pages.is_empty(), "Save", BtnKind::Primary, || a.push(Action::Save));
             ui.menu_button("More", |ui| {
                 egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
                     ui.label("Files & Pages");
@@ -910,9 +904,9 @@ impl PdfWizardApp {
                     ui.separator();
                     ui.label("Zoom & Theme");
                     ui.horizontal(|ui| {
-                        touch_btn(ui, true, " - ", false, || a.push(Action::ZoomOut));
-                        touch_btn(ui, true, "Reset", false, || a.push(Action::ZoomReset));
-                        touch_btn(ui, true, " + ", false, || a.push(Action::ZoomIn));
+                        ant_btn(ui, t, true, " - ", BtnKind::Default, || a.push(Action::ZoomOut));
+                        ant_btn(ui, t, true, "Reset", BtnKind::Default, || a.push(Action::ZoomReset));
+                        ant_btn(ui, t, true, " + ", BtnKind::Default, || a.push(Action::ZoomIn));
                     });
                     ui.add(egui::Slider::new(&mut self.zoom, 80.0..=400.0).show_value(false));
                     let theme_lbl = if self.dark { "Switch to Light Theme" } else { "Switch to Dark Theme" };
@@ -925,61 +919,88 @@ impl PdfWizardApp {
     }
 
     fn selection_bar(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        let t = AntTokens::for_mode(self.dark);
         let count = self.selected.len();
         ui.horizontal_wrapped(|ui| {
-            ui.strong(format!("{count} sel"));
+            ui.label(egui::RichText::new(format!("{count} selected")).strong().color(t.primary));
             ui.separator();
-            touch_btn(ui, true, "<", false, || a.push(Action::StepLeft));
-            touch_btn(ui, true, ">", false, || a.push(Action::StepRight));
+            ant_btn(ui, t, true, "<", BtnKind::Default, || a.push(Action::StepLeft));
+            ant_btn(ui, t, true, ">", BtnKind::Default, || a.push(Action::StepRight));
             ui.separator();
-            touch_btn(ui, true, "Rotate L", false, || a.push(Action::RotateLeft));
-            touch_btn(ui, true, "Rotate R", false, || a.push(Action::RotateRight));
-            touch_btn(ui, true, "Crop", false, || a.push(Action::CropDialog));
-            touch_btn(ui, true, "Dup", false, || a.push(Action::Duplicate));
+            ant_btn(ui, t, true, "Rotate L", BtnKind::Default, || a.push(Action::RotateLeft));
+            ant_btn(ui, t, true, "Rotate R", BtnKind::Default, || a.push(Action::RotateRight));
+            ant_btn(ui, t, true, "Crop", BtnKind::Default, || a.push(Action::CropDialog));
+            ant_btn(ui, t, true, "Dup", BtnKind::Default, || a.push(Action::Duplicate));
             ui.menu_button("Extract", |ui| {
                 mi(ui, a, "Single PDF...", "", Action::ExtractSingle);
                 mi(ui, a, "Separate PDFs...", "", Action::ExtractSeparate);
             });
-            touch_btn(ui, true, "Delete", false, || a.push(Action::Delete));
-            touch_btn(ui, true, "Clear", false, || a.push(Action::SelectNone));
+            ant_btn(ui, t, true, "Delete", BtnKind::Danger, || a.push(Action::Delete));
+            ant_btn(ui, t, true, "Clear", BtnKind::Default, || a.push(Action::SelectNone));
         });
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
+        let t = AntTokens::for_mode(self.dark);
         ui.horizontal_wrapped(|ui| {
             if let Some(msg) = &self.busy {
                 ui.spinner();
-                ui.small(msg);
+                ui.label(egui::RichText::new(msg).small().color(t.primary));
                 ui.separator();
             }
-            ui.small(format!(
-                "{} pages | {} source(s) | {}",
-                self.pages.len(),
-                self.sources.len(),
-                self.status
-            ));
+            ui.label(
+                egui::RichText::new(format!("{} pages | {} source(s)", self.pages.len(), self.sources.len()))
+                    .small()
+                    .color(t.text_secondary),
+            );
+            ui.separator();
+            let status_color = if self.status.starts_with("Error:") {
+                t.danger
+            } else if self.status.starts_with("Saved ")
+                || self.status.starts_with("Wrote ")
+                || self.status.starts_with("Loaded ")
+            {
+                t.success
+            } else {
+                t.text_secondary
+            };
+            ui.label(egui::RichText::new(&self.status).small().color(status_color));
         });
     }
 
     fn grid(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        let t = AntTokens::for_mode(self.dark);
         if self.pages.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.25).max(20.0));
-                ui.heading("PDF Wizard");
-                ui.add_space(8.0);
-                ui.label("Tap Open to choose PDF or image files, or drop files onto this window.");
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    let w = ui.available_width();
-                    let pad = ((w - 380.0) * 0.5).max(0.0);
-                    ui.add_space(pad);
-                    if ui.add_sized([200.0, 48.0], egui::Button::new("Open PDF or Images")).clicked() {
-                        a.push(Action::Open);
-                    }
-                    if ui.add_sized([165.0, 48.0], egui::Button::new("Insert Blank Page")).clicked() {
-                        a.push(Action::InsertBlank);
-                    }
-                });
+                ui.add_space((ui.available_height() * 0.22).max(20.0));
+                egui::Frame::new()
+                    .fill(t.bg_container)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(32, 28))
+                    .show(ui, |ui| {
+                        ui.set_max_width(440.0);
+                        ui.vertical_centered(|ui| {
+                            ui.heading(egui::RichText::new("PDF Wizard").color(t.text));
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Tap Open to choose PDF or image files, or drop files onto this window.")
+                                    .color(t.text_secondary),
+                            );
+                            ui.add_space(20.0);
+                            ui.horizontal(|ui| {
+                                let w = ui.available_width();
+                                let pad = ((w - 376.0) * 0.5).max(0.0);
+                                ui.add_space(pad);
+                                ant_btn_sized(ui, t, [200.0, 48.0], true, "Open PDF or Images", BtnKind::Primary, || {
+                                    a.push(Action::Open);
+                                });
+                                ant_btn_sized(ui, t, [165.0, 48.0], true, "Insert Blank Page", BtnKind::Default, || {
+                                    a.push(Action::InsertBlank);
+                                });
+                            });
+                        });
+                    });
             });
             return;
         }
@@ -1037,47 +1058,51 @@ impl PdfWizardApp {
         let body_resp = ui.interact(body_rect, ui.scope_id().with(("bdy", item.uid, i)), body_sense);
 
         if ui.is_rect_visible(rect) {
+            let t = AntTokens::for_mode(self.dark);
             let thumb = item.source_id.map(|sid| self.ensure_thumb(sid, item.source_page_num));
             let painter = ui.painter_at(rect);
-            let visuals = ui.visuals().clone();
-            let bg = if selected { visuals.selection.bg_fill } else { visuals.faint_bg_color };
+            let bg = if selected { t.primary_bg } else { t.bg_container };
             painter.rect_filled(rect, 8.0, bg);
-            if selected {
-                painter.rect_stroke(
-                    rect,
-                    8.0,
-                    egui::Stroke::new(2.5, visuals.selection.stroke.color),
-                    egui::StrokeKind::Inside,
-                );
-            }
+            let border_stroke = if selected {
+                egui::Stroke::new(2.0, t.primary)
+            } else {
+                egui::Stroke::new(1.0, t.border)
+            };
+            painter.rect_stroke(rect, 8.0, border_stroke, egui::StrokeKind::Inside);
 
-            // Top-left touch checkbox
-            let chk_fill = if selected { visuals.selection.stroke.color } else { visuals.widgets.inactive.bg_fill };
+            // Top-left touch checkbox (Ant Design Checkbox)
+            let chk_fill = if selected { t.primary } else { t.bg_container };
             painter.rect_filled(check_rect.shrink(3.0), 6.0, chk_fill);
             painter.text(
                 check_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 if selected { "✓" } else { " " },
                 egui::FontId::proportional(16.0),
-                if selected { egui::Color32::WHITE } else { visuals.text_color() },
+                if selected { egui::Color32::WHITE } else { t.text },
             );
             if !selected {
                 painter.rect_stroke(
                     check_rect.shrink(3.0),
                     6.0,
-                    egui::Stroke::new(1.5, visuals.widgets.inactive.fg_stroke.color),
+                    egui::Stroke::new(1.5, t.border),
                     egui::StrokeKind::Inside,
                 );
             }
 
             // Top-right touch drag handle
-            painter.rect_filled(handle_rect.shrink(3.0), 6.0, visuals.widgets.inactive.bg_fill);
+            painter.rect_filled(handle_rect.shrink(3.0), 6.0, t.bg_elevated);
+            painter.rect_stroke(
+                handle_rect.shrink(3.0),
+                6.0,
+                egui::Stroke::new(1.0, t.border_secondary),
+                egui::StrokeKind::Inside,
+            );
             painter.text(
                 handle_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "⋮⋮",
                 egui::FontId::proportional(15.0),
-                visuals.text_color(),
+                t.text_secondary,
             );
 
             // Top-center page number & transform tags (clipped to avoid overlapping side buttons)
@@ -1086,7 +1111,7 @@ impl PdfWizardApp {
                 egui::Align2::CENTER_CENTER,
                 card_header_text(i, &item, size.x),
                 egui::FontId::proportional(12.5),
-                visuals.text_color(),
+                if selected { t.primary } else { t.text },
             );
 
             // Thumbnail area
@@ -1141,7 +1166,7 @@ impl PdfWizardApp {
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::proportional(11.0),
-                visuals.weak_text_color(),
+                t.text_secondary,
             );
         }
 
@@ -1192,6 +1217,7 @@ impl PdfWizardApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        let t = AntTokens::for_mode(self.dark);
         let mut open = self.show_meta;
         let mut close_meta = false;
         egui::Window::new("Document Metadata")
@@ -1212,11 +1238,11 @@ impl PdfWizardApp {
                     }
                 });
                 ui.add_space(6.0);
-                ui.label("Applied when saving or extracting.");
+                ui.label(egui::RichText::new("Applied when saving or extracting.").color(t.text_secondary));
                 ui.add_space(8.0);
-                if ui.add_sized([120.0, TOUCH_HEIGHT], egui::Button::new("Done")).clicked() {
+                ant_btn_sized(ui, t, [120.0, TOUCH_HEIGHT], true, "Done", BtnKind::Primary, || {
                     close_meta = true;
-                }
+                });
             });
         self.show_meta = open && !close_meta;
 
@@ -1238,13 +1264,13 @@ impl PdfWizardApp {
                 ui.add(egui::Slider::new(&mut self.scale_edit, 10.0..=400.0).text("Scale %"));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add_sized([160.0, TOUCH_HEIGHT], egui::Button::new("Apply to selected")).clicked() {
+                    ant_btn_sized(ui, t, [160.0, TOUCH_HEIGHT], true, "Apply to selected", BtnKind::Primary, || {
                         apply = true;
-                    }
-                    if ui.add_sized([110.0, TOUCH_HEIGHT], egui::Button::new("Reset")).clicked() {
+                    });
+                    ant_btn_sized(ui, t, [110.0, TOUCH_HEIGHT], true, "Reset", BtnKind::Default, || {
                         self.crop_edit = [0.0; 4];
                         self.scale_edit = 100.0;
-                    }
+                    });
                 });
             });
         self.show_crop = open && !apply;
@@ -1254,11 +1280,41 @@ impl PdfWizardApp {
     }
 }
 
-fn touch_btn(ui: &mut egui::Ui, enabled: bool, label: &str, active: bool, on_click: impl FnOnce()) {
-    let mut btn = egui::Button::new(label).min_size(Vec2::new(0.0, TOUCH_HEIGHT));
-    if active {
-        btn = btn.fill(ui.visuals().selection.bg_fill);
-    }
+fn make_ant_button(t: AntTokens, label: &str, kind: BtnKind, min_size: Vec2) -> egui::Button<'_> {
+    let (fill, stroke_col, text_col) = match kind {
+        BtnKind::Primary => (t.primary, t.primary, egui::Color32::WHITE),
+        BtnKind::Active => (t.primary_bg, t.primary, t.primary),
+        BtnKind::Danger => (t.danger_bg, t.danger, t.danger),
+        BtnKind::Default => (t.bg_container, t.border, t.text),
+    };
+    egui::Button::new(egui::RichText::new(label).color(text_col))
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke_col))
+        .corner_radius(egui::CornerRadius::same(6))
+        .min_size(min_size)
+}
+
+fn ant_btn(
+    ui: &mut egui::Ui,
+    t: AntTokens,
+    enabled: bool,
+    label: &str,
+    kind: BtnKind,
+    on_click: impl FnOnce(),
+) {
+    ant_btn_sized(ui, t, Vec2::new(0.0, TOUCH_HEIGHT), enabled, label, kind, on_click);
+}
+
+fn ant_btn_sized(
+    ui: &mut egui::Ui,
+    t: AntTokens,
+    size: impl Into<Vec2>,
+    enabled: bool,
+    label: &str,
+    kind: BtnKind,
+    on_click: impl FnOnce(),
+) {
+    let btn = make_ant_button(t, label, kind, size.into());
     if ui.add_enabled(enabled, btn).clicked() {
         on_click();
     }
@@ -1473,5 +1529,19 @@ mod tests {
         app.add_loaded(&[f2], true);
         assert!(app.clipboard.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ant_theme_supports_light_and_dark_modes() {
+        let ctx = egui::Context::default();
+        theme::apply_ant_theme(&ctx, false);
+        assert!(!ctx.global_style().visuals.dark_mode);
+        assert_eq!(ctx.global_style().visuals.panel_fill, AntTokens::light().bg_layout);
+        assert!(ctx.global_style().spacing.interact_size.y >= 44.0);
+
+        theme::apply_ant_theme(&ctx, true);
+        assert!(ctx.global_style().visuals.dark_mode);
+        assert_eq!(ctx.global_style().visuals.panel_fill, AntTokens::dark().bg_layout);
+        assert!(ctx.global_style().spacing.interact_size.y >= 44.0);
     }
 }

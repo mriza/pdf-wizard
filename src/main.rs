@@ -6,6 +6,7 @@ mod history;
 mod model;
 mod pdf_engine;
 mod renderer;
+mod theme;
 
 use eframe::egui;
 
