@@ -924,10 +924,6 @@ impl PdfWizardApp {
         let (dx, tip) = if open { (-5.0, 5.0) } else { (5.0, -5.0) };
         painter.line_segment([egui::pos2(c.x + dx, c.y - 10.0), egui::pos2(c.x + tip, c.y)], stroke);
         painter.line_segment([egui::pos2(c.x + tip, c.y), egui::pos2(c.x + dx, c.y + 10.0)], stroke);
-        // Grip dots above and below the chevron.
-        for off in [-34.0_f32, -24.0, 24.0, 34.0] {
-            painter.circle_filled(egui::pos2(c.x, c.y + off), 2.0, ink);
-        }
 
         if resp.clicked() {
             a.push(Action::ToggleTools);
