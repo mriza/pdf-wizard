@@ -128,3 +128,4 @@ mod tests {
         assert_eq!(booklet_order(4), vec![Some(3), Some(0), Some(1), Some(2)]);
     }
 }
+
