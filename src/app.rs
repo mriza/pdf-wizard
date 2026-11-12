@@ -13,6 +13,20 @@ const THUMB_PX: u32 = 360;
 const SPACING: f32 = 16.0;
 const CARD_HEADER_H: f32 = 40.0;
 const CARD_BTN_H: f32 = 36.0;
+const TOOLS_HANDLE_W: f32 = 36.0;
+const TOOLS_HANDLE_H: f32 = 120.0;
+
+/// Maps a horizontal swipe distance on the tools handle to the desired panel state:
+/// left swipe opens, right swipe closes, short movement is ignored.
+fn handle_swipe(dx: f32) -> Option<bool> {
+    if dx <= -24.0 {
+        Some(true)
+    } else if dx >= 24.0 {
+        Some(false)
+    } else {
+        None
+    }
+}
 
 fn card_header_text(index: usize, item: &PageItem, card_width: f32) -> String {
     if card_width < 130.0 {
@@ -881,9 +895,53 @@ impl PdfWizardApp {
             ant_btn(ui, t, true, "Reorder", reo_kind, || a.push(Action::ToggleReorderMode));
             ui.separator();
             ant_btn(ui, t, !self.pages.is_empty(), "Save", BtnKind::Primary, || a.push(Action::Save));
-            let tools_kind = if self.show_tools { BtnKind::Active } else { BtnKind::Default };
-            ant_btn(ui, t, true, "Tools", tools_kind, || a.push(Action::ToggleTools));
         });
+    }
+
+    /// Always-visible edge handle at the far right: tap to toggle the Tools panel,
+    /// or swipe left/right on it.
+    fn tools_handle(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        let t = AntTokens::for_mode(self.dark);
+        let open = self.show_tools;
+        let avail = ui.available_size();
+        let h = TOOLS_HANDLE_H.min(avail.y);
+        ui.add_space(((avail.y - h) * 0.5).max(0.0));
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(avail.x, h), Sense::click_and_drag());
+        let (fill, stroke_col) = if open {
+            (t.primary, t.primary)
+        } else if resp.hovered() {
+            (t.primary_bg, t.primary_hover)
+        } else {
+            (t.bg_container, t.primary)
+        };
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 8.0, fill);
+        painter.rect_stroke(rect, 8.0, egui::Stroke::new(1.5, stroke_col), egui::StrokeKind::Inside);
+        let ink = if open { egui::Color32::WHITE } else { t.primary };
+        let stroke = egui::Stroke::new(3.0, ink);
+        // Chevron drawn with lines (no font glyphs): "<" when closed (opens leftwards), ">" when open.
+        let c = rect.center();
+        let (dx, tip) = if open { (-5.0, 5.0) } else { (5.0, -5.0) };
+        painter.line_segment([egui::pos2(c.x + dx, c.y - 10.0), egui::pos2(c.x + tip, c.y)], stroke);
+        painter.line_segment([egui::pos2(c.x + tip, c.y), egui::pos2(c.x + dx, c.y + 10.0)], stroke);
+        // Grip dots above and below the chevron.
+        for off in [-34.0_f32, -24.0, 24.0, 34.0] {
+            painter.circle_filled(egui::pos2(c.x, c.y + off), 2.0, ink);
+        }
+
+        if resp.clicked() {
+            a.push(Action::ToggleTools);
+        } else if resp.drag_stopped() {
+            let dx = ui.input(|i| match (i.pointer.press_origin(), i.pointer.latest_pos()) {
+                (Some(o), Some(p)) => p.x - o.x,
+                _ => 0.0,
+            });
+            if let Some(want_open) = handle_swipe(dx) {
+                if want_open != open {
+                    a.push(Action::ToggleTools);
+                }
+            }
+        }
     }
 
     fn tools_panel(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
@@ -1409,6 +1467,14 @@ impl eframe::App for PdfWizardApp {
         if !self.selected.is_empty() {
             egui::Panel::bottom("selection_bar").show(ui, |ui| self.selection_bar(ui, &mut actions));
         }
+        // Declared first so the handle stays at the far right edge; the panel opens to its left.
+        let handle_frame = egui::Frame::new().fill(AntTokens::for_mode(self.dark).bg_layout);
+        egui::Panel::right("tools_handle")
+            .exact_size(TOOLS_HANDLE_W)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(handle_frame)
+            .show(ui, |ui| self.tools_handle(ui, &mut actions));
         if self.show_tools {
             egui::Panel::right("tools_panel")
                 .resizable(false)
@@ -1615,6 +1681,14 @@ mod tests {
         assert!(ctx.global_style().visuals.dark_mode);
         assert_eq!(ctx.global_style().visuals.panel_fill, AntTokens::dark().bg_layout);
         assert!(ctx.global_style().spacing.interact_size.y >= 44.0);
+    }
+
+    #[test]
+    fn handle_swipe_direction_and_threshold() {
+        assert_eq!(handle_swipe(-60.0), Some(true));
+        assert_eq!(handle_swipe(60.0), Some(false));
+        assert_eq!(handle_swipe(10.0), None);
+        assert_eq!(handle_swipe(-10.0), None);
     }
 
     #[test]
