@@ -6,6 +6,7 @@ pub struct History {
     pos: usize,
 }
 
+#[allow(dead_code)]
 impl History {
     pub fn new(initial: Vec<PageItem>) -> Self {
         History { stack: vec![initial], pos: 0 }
