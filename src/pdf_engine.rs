@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct SourceDocument {
     pub id: SourceId,
     pub file_name: String,
@@ -133,17 +134,18 @@ fn num_array(b: [f32; 4]) -> Object {
 }
 
 /// Wraps a source page's content as a Form XObject in the destination document.
-fn make_form(src: &Document, dst: &mut Document, map: &mut IdMap, spid: ObjectId) -> ObjectId {
+fn make_form_with_bbox(
+    src: &Document,
+    dst: &mut Document,
+    map: &mut IdMap,
+    spid: ObjectId,
+    bbox: [f32; 4],
+) -> ObjectId {
     let content = src.get_page_content(spid);
     let res = match inherited(src, spid, b"Resources") {
         Some(r) => remap(src, dst, map, &r),
         None => Object::Dictionary(Dictionary::new()),
     };
-    let bbox = inherited(src, spid, b"MediaBox")
-        .and_then(|o| resolve_numbers(src, &o))
-        .filter(|v| v.len() == 4)
-        .map(|v| [v[0], v[1], v[2], v[3]])
-        .unwrap_or([0.0, 0.0, A4_W, A4_H]);
     let dict = dictionary! {
         "Type" => "XObject",
         "Subtype" => "Form",
@@ -151,6 +153,15 @@ fn make_form(src: &Document, dst: &mut Document, map: &mut IdMap, spid: ObjectId
         "Resources" => res,
     };
     dst.add_object(Stream::new(dict, content))
+}
+
+fn make_form(src: &Document, dst: &mut Document, map: &mut IdMap, spid: ObjectId) -> ObjectId {
+    let bbox = inherited(src, spid, b"MediaBox")
+        .and_then(|o| resolve_numbers(src, &o))
+        .filter(|v| v.len() == 4)
+        .map(|v| [v[0], v[1], v[2], v[3]])
+        .unwrap_or([0.0, 0.0, A4_W, A4_H]);
+    make_form_with_bbox(src, dst, map, spid, bbox)
 }
 
 fn content_refs(dst: &Document, page: &Dictionary) -> Vec<Object> {
@@ -410,8 +421,7 @@ pub fn image_to_source(id: SourceId, file_name: &str, bytes: &[u8]) -> Result<So
     load_pdf(id, file_name, out)
 }
 
-/// Imposes pages 2-up on landscape sheets in saddle-stitch order.
-/// Known limitation: a page's /Rotate and CropBox are not honored in the imposed sheet.
+/// Imposes pages 2-up on landscape sheets in saddle-stitch order, honoring `/Rotate` and `CropBox`.
 pub fn export_booklet(
     pages: &[PageItem],
     sources: &HashMap<SourceId, SourceDocument>,
@@ -419,15 +429,25 @@ pub fn export_booklet(
 ) -> Result<Vec<u8>> {
     let flat = Document::load_mem(&export_pages(pages, sources, meta)?)?;
     let ids: Vec<ObjectId> = flat.get_pages().values().copied().collect();
-    let size = |pid: ObjectId| {
-        flat.get_dictionary(pid)
+    let page_geom = |pid: ObjectId| -> ([f32; 4], i64, f32, f32) {
+        let Ok(d) = flat.get_dictionary(pid) else {
+            return ([0.0, 0.0, A4_W, A4_H], 0, A4_W, A4_H);
+        };
+        let mb = box_of(&flat, d, b"MediaBox").unwrap_or([0.0, 0.0, A4_W, A4_H]);
+        let bbox = box_of(&flat, d, b"CropBox").unwrap_or(mb);
+        let rot = d
+            .get(b"Rotate")
             .ok()
-            .and_then(|d| box_of(&flat, d, b"MediaBox"))
-            .map(|b| (b[2] - b[0], b[3] - b[1]))
-            .unwrap_or((A4_W, A4_H))
+            .and_then(|r| flat.dereference(r).ok())
+            .and_then(|(_, o)| o.as_i64().ok())
+            .unwrap_or(0)
+            .rem_euclid(360);
+        let (vw, vh) = ((bbox[2] - bbox[0]).abs(), (bbox[3] - bbox[1]).abs());
+        let (pw, ph) = if rot == 90 || rot == 270 { (vh, vw) } else { (vw, vh) };
+        (bbox, rot, pw, ph)
     };
-    let slot_w = ids.iter().map(|&p| size(p).0).fold(0.0, f32::max);
-    let slot_h = ids.iter().map(|&p| size(p).1).fold(0.0, f32::max);
+    let slot_w = ids.iter().map(|&p| page_geom(p).2).fold(0.0, f32::max);
+    let slot_h = ids.iter().map(|&p| page_geom(p).3).fold(0.0, f32::max);
 
     let mut dst = Document::with_version("1.5");
     let pages_id = dst.new_object_id();
@@ -439,13 +459,20 @@ pub fn export_booklet(
         for (slot, entry) in sheet.iter().enumerate() {
             let Some(idx) = entry else { continue };
             let pid = ids[*idx];
-            let (pw, ph) = size(pid);
-            let form = make_form(&flat, &mut dst, &mut map, pid);
+            let (bbox, rot, pw, ph) = page_geom(pid);
+            let form = make_form_with_bbox(&flat, &mut dst, &mut map, pid, bbox);
             let name = format!("Fm{slot}");
             xobjs.set(name.clone(), Object::Reference(form));
-            let dx = slot as f32 * slot_w + (slot_w - pw) / 2.0;
-            let dy = (slot_h - ph) / 2.0;
-            content.push_str(&format!("q 1 0 0 1 {dx} {dy} cm /{name} Do Q\n"));
+            let sx = slot as f32 * slot_w + (slot_w - pw) / 2.0;
+            let sy = (slot_h - ph) / 2.0;
+            let [x0, y0, x1, y1] = bbox;
+            let (a, b, c, d, e, f) = match rot {
+                90 => (0.0, -1.0, 1.0, 0.0, sx - y0, sy + x1),
+                180 => (-1.0, 0.0, 0.0, -1.0, sx + x1, sy + y1),
+                270 => (0.0, 1.0, -1.0, 0.0, sx + y1, sy - x0),
+                _ => (1.0, 0.0, 0.0, 1.0, sx - x0, sy - y0),
+            };
+            content.push_str(&format!("q {a} {b} {c} {d} {e} {f} cm /{name} Do Q\n"));
         }
         let cid = dst.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
         let page = dst.add_object(dictionary! {
@@ -458,6 +485,21 @@ pub fn export_booklet(
         kids.push(Object::Reference(page));
     }
     finish_document(dst, pages_id, kids, meta)
+}
+
+fn unique_extract_path(dir: &Path, stem: &str, index: usize) -> PathBuf {
+    let base = dir.join(format!("{stem}_page_{index}.pdf"));
+    if !base.exists() {
+        return base;
+    }
+    let mut suffix = 1usize;
+    loop {
+        let candidate = dir.join(format!("{stem}_page_{index}_{suffix}.pdf"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 pub fn extract_separate(
@@ -477,7 +519,7 @@ pub fn extract_separate(
             .and_then(|s| Path::new(&s.file_name).file_stem().map(|x| x.to_string_lossy().to_string()))
             .unwrap_or_else(|| "blank".to_string());
         let bytes = export_pages(std::slice::from_ref(item), sources, meta)?;
-        let path = dir.join(format!("{stem}_page_{}.pdf", i + 1));
+        let path = unique_extract_path(dir, &stem, i + 1);
         std::fs::write(&path, bytes)?;
         written.push(path);
     }
@@ -711,7 +753,7 @@ mod tests {
         let out = export_pages(&[with, item(2, 1)], &src, &Metadata::default()).unwrap();
         let (doc, id) = out_page(&out, 2);
         let (res, _) = doc.get_page_resources(id).unwrap();
-        assert!(res.map_or(true, |r| !r.has(b"XObject")));
+        assert!(res.is_none_or(|r| !r.has(b"XObject")));
     }
 
     fn png(w: u32, h: u32) -> Vec<u8> {
@@ -779,5 +821,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn booklet_honors_rotate_and_crop() {
+        let src = sources(make_pdf(4), "a.pdf");
+        let mut pages: Vec<PageItem> = (1..=4).map(|n| item(n as u64, n)).collect();
+        pages[0].rotate(90);
+        pages[0].crop = CropMargins { left: 0.1, right: 0.1, top: 0.0, bottom: 0.0 };
+        let out = export_booklet(&pages, &src, &Metadata::default()).unwrap();
+        let (doc, id) = out_page(&out, 1);
+        // Rotated 90 deg page has visual width 842 (taller than 595), so slot_w=842 and sheet width=1684.
+        let mb = boxf(doc.get_dictionary(id).unwrap(), b"MediaBox");
+        assert!((mb[2] - 1684.0).abs() < 0.1, "got width {}", mb[2]);
+        assert!(page_text(&doc, 1).contains("cm"));
+    }
+
+    #[test]
+    fn extract_separate_avoids_overwriting_existing_file() {
+        let src = sources(make_pdf(1), "report.pdf");
+        let dir = std::env::temp_dir().join(format!("pdfwiz_ext_unique_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("report_page_1.pdf");
+        std::fs::write(&existing, b"keep-me").unwrap();
+
+        let files = extract_separate(&[item(1, 1)], &src, &dir, &Metadata::default()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name().unwrap(), "report_page_1_1.pdf");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

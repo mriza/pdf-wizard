@@ -1,5 +1,7 @@
 use crate::model::PageItem;
 
+const MAX_HISTORY: usize = 100;
+
 /// Snapshot-based undo/redo over the page list.
 pub struct History {
     stack: Vec<Vec<PageItem>>,
@@ -15,7 +17,11 @@ impl History {
     pub fn push(&mut self, pages: Vec<PageItem>) {
         self.stack.truncate(self.pos + 1);
         self.stack.push(pages);
-        self.pos += 1;
+        if self.stack.len() > MAX_HISTORY {
+            let excess = self.stack.len() - MAX_HISTORY;
+            self.stack.drain(0..excess);
+        }
+        self.pos = self.stack.len() - 1;
     }
 
     pub fn undo(&mut self) -> Option<Vec<PageItem>> {
@@ -70,5 +76,18 @@ mod tests {
     fn undo_at_start_returns_none() {
         let mut h = History::new(list(1));
         assert!(h.undo().is_none());
+    }
+
+    #[test]
+    fn history_caps_at_max_entries() {
+        let mut h = History::new(list(0));
+        for i in 1..=MAX_HISTORY + 10 {
+            h.push(list(i));
+        }
+        let mut steps = 0;
+        while h.undo().is_some() {
+            steps += 1;
+        }
+        assert_eq!(steps, MAX_HISTORY - 1);
     }
 }

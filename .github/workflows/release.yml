@@ -13,27 +13,35 @@ jobs:
           - os: ubuntu-latest
             artifact: pdf-wizard-linux
             bin: pdf-wizard
-            asset: pdf-wizard-linux
+            asset: pdf-wizard-linux.tar.gz
+            archive: true
           - os: macos-latest
             artifact: pdf-wizard-macos
             bin: pdf-wizard
-            asset: pdf-wizard-macos
+            asset: pdf-wizard-macos.tar.gz
+            archive: true
           - os: windows-latest
             artifact: pdf-wizard-windows
             bin: pdf-wizard.exe
             asset: pdf-wizard-windows.exe
+            archive: false
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
       - run: cargo build --release
       - shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          if [ "${{ matrix.archive }}" = "true" ]; then
+            tar -C target/release -czf "dist/${{ matrix.asset }}" "${{ matrix.bin }}"
+          else
+            cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

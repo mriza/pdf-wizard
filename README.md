@@ -31,6 +31,5 @@ pdf-wizard [file.pdf ...]
 
 - Password-protected PDFs are rejected with an error.
 - Page annotations/links are not carried into exported files.
-- Booklet sheets ignore a page's `/Rotate` and crop box.
 - Thumbnails use the pure-Rust `hayro` rasterizer; unusual PDFs may show "no preview" (export is unaffected).
 

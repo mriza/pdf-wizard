@@ -132,10 +132,63 @@ pub struct PdfWizardApp {
     scale_edit: f32,
     dragging: bool,
     drop_target: Option<usize>,
+    busy: Option<String>,
+    bg_rx: Option<std::sync::mpsc::Receiver<BgResult>>,
 }
 
 fn is_pdf(p: &Path) -> bool {
-    p.extension().map_or(false, |e| e.eq_ignore_ascii_case("pdf"))
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+enum BgResult {
+    Loaded {
+        sources: HashMap<SourceId, SourceDocument>,
+        items: Vec<PageItem>,
+        next_source: SourceId,
+        next_uid: u64,
+        status: String,
+        replace: bool,
+    },
+    Message(String),
+}
+
+fn load_paths_into(
+    paths: &[PathBuf],
+    next_source: &mut SourceId,
+    next_uid: &mut u64,
+) -> (HashMap<SourceId, SourceDocument>, Vec<PageItem>, String) {
+    let mut new_sources = HashMap::new();
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        let name = path.file_name().map_or("file".to_string(), |n| n.to_string_lossy().to_string());
+        let id = *next_source;
+        let result = std::fs::read(path).map_err(anyhow::Error::from).and_then(|bytes| {
+            if is_pdf(path) {
+                pdf_engine::load_pdf(id, &name, bytes)
+            } else {
+                pdf_engine::image_to_source(id, &name, &bytes)
+            }
+        });
+        match result {
+            Ok(src) => {
+                *next_source += 1;
+                for n in 1..=src.page_count as u32 {
+                    let (w, h) = pdf_engine::page_size(&src, n);
+                    *next_uid += 1;
+                    items.push(PageItem::from_source(*next_uid, id, n, w, h, format!("{name} - p.{n}")));
+                }
+                new_sources.insert(id, src);
+            }
+            Err(e) => errors.push(format!("{name}: {e}")),
+        }
+    }
+    let status = if errors.is_empty() {
+        format!("Loaded {} page(s)", items.len())
+    } else {
+        format!("Error: {}", errors.join("; "))
+    };
+    (new_sources, items, status)
 }
 
 impl PdfWizardApp {
@@ -163,6 +216,8 @@ impl PdfWizardApp {
             scale_edit: 100.0,
             dragging: false,
             drop_target: None,
+            busy: None,
+            bg_rx: None,
         }
     }
 
@@ -239,36 +294,10 @@ impl PdfWizardApp {
 
     /// Loads PDFs and images; never changes workspace state on failure. Errors go to the status bar.
     fn load_paths(&mut self, paths: &[PathBuf]) -> Vec<PageItem> {
-        let mut items = Vec::new();
-        let mut errors = Vec::new();
-        for path in paths {
-            let name = path.file_name().map_or("file".to_string(), |n| n.to_string_lossy().to_string());
-            let id = self.next_source;
-            let result = std::fs::read(path).map_err(anyhow::Error::from).and_then(|bytes| {
-                if is_pdf(path) {
-                    pdf_engine::load_pdf(id, &name, bytes)
-                } else {
-                    pdf_engine::image_to_source(id, &name, &bytes)
-                }
-            });
-            match result {
-                Ok(src) => {
-                    self.next_source += 1;
-                    for n in 1..=src.page_count as u32 {
-                        let (w, h) = pdf_engine::page_size(&src, n);
-                        let uid = self.uid();
-                        items.push(PageItem::from_source(uid, id, n, w, h, format!("{name} - p.{n}")));
-                    }
-                    self.sources.insert(id, src);
-                }
-                Err(e) => errors.push(format!("{name}: {e}")),
-            }
-        }
-        self.status = if errors.is_empty() {
-            format!("Loaded {} page(s)", items.len())
-        } else {
-            format!("Error: {}", errors.join("; "))
-        };
+        let (new_sources, items, status) =
+            load_paths_into(paths, &mut self.next_source, &mut self.next_uid);
+        self.sources.extend(new_sources);
+        self.status = status;
         items
     }
 
@@ -364,28 +393,40 @@ impl PdfWizardApp {
         let has_sel = !self.selected.is_empty();
         match action {
             Action::Open | Action::Append => {
+                if self.busy.is_some() {
+                    self.status = "Busy, please wait...".into();
+                    return;
+                }
                 let replace = matches!(action, Action::Open);
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("PDF and images", &["pdf", "png", "jpg", "jpeg", "webp"])
                     .pick_files()
                 {
-                    self.add_loaded(&paths, replace);
+                    self.start_load_bg(paths, replace);
                 }
             }
             Action::ImportImages => {
+                if self.busy.is_some() {
+                    self.status = "Busy, please wait...".into();
+                    return;
+                }
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
                     .pick_files()
                 {
-                    self.add_loaded(&paths, false);
+                    self.start_load_bg(paths, false);
                 }
             }
             Action::DropFiles(paths) => {
+                if self.busy.is_some() {
+                    self.status = "Busy, please wait...".into();
+                    return;
+                }
                 let ok: Vec<PathBuf> = paths
                     .into_iter()
                     .filter(|p| {
                         is_pdf(p)
-                            || p.extension().map_or(false, |e| {
+                            || p.extension().is_some_and(|e| {
                                 ["png", "jpg", "jpeg", "webp"].iter().any(|x| e.eq_ignore_ascii_case(x))
                             })
                     })
@@ -393,7 +434,7 @@ impl PdfWizardApp {
                 if ok.is_empty() {
                     self.status = "Dropped files are not PDF or image files".into();
                 } else {
-                    self.add_loaded(&ok, false);
+                    self.start_load_bg(ok, false);
                 }
             }
             Action::Save => {
@@ -620,8 +661,22 @@ impl PdfWizardApp {
         p
     }
 
+    #[cfg(test)]
     fn add_loaded(&mut self, paths: &[PathBuf], replace: bool) {
         let loaded = self.load_paths(paths);
+        let status = self.status.clone();
+        self.apply_loaded(HashMap::new(), loaded, status, replace);
+    }
+
+    fn apply_loaded(
+        &mut self,
+        new_sources: HashMap<SourceId, SourceDocument>,
+        loaded: Vec<PageItem>,
+        status: String,
+        replace: bool,
+    ) {
+        self.sources.extend(new_sources);
+        self.status = status;
         if loaded.is_empty() {
             return;
         }
@@ -630,6 +685,7 @@ impl PdfWizardApp {
             self.history = History::new(self.pages.clone());
             self.selected.clear();
             self.anchor = None;
+            self.clipboard.clear();
             let keep: std::collections::HashSet<SourceId> =
                 self.pages.iter().filter_map(|p| p.source_id).collect();
             self.sources.retain(|id, _| keep.contains(id));
@@ -639,6 +695,49 @@ impl PdfWizardApp {
             let mut pages = self.pages.clone();
             pages.extend(loaded);
             self.commit(pages);
+        }
+    }
+
+    fn spawn_bg(&mut self, label: &str, job: impl FnOnce() -> BgResult + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.busy = Some(label.to_string());
+        self.bg_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+    }
+
+    fn start_load_bg(&mut self, paths: Vec<PathBuf>, replace: bool) {
+        let mut next_source = self.next_source;
+        let mut next_uid = self.next_uid;
+        self.spawn_bg("Loading files...", move || {
+            let (sources, items, status) = load_paths_into(&paths, &mut next_source, &mut next_uid);
+            BgResult::Loaded { sources, items, next_source, next_uid, status, replace }
+        });
+    }
+
+    fn poll_bg(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.bg_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(res) => {
+                self.busy = None;
+                self.bg_rx = None;
+                match res {
+                    BgResult::Loaded { sources, items, next_source, next_uid, status, replace } => {
+                        self.next_source = self.next_source.max(next_source);
+                        self.next_uid = self.next_uid.max(next_uid);
+                        self.apply_loaded(sources, items, status, replace);
+                    }
+                    BgResult::Message(msg) => self.status = msg,
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.busy = None;
+                self.bg_rx = None;
+            }
         }
     }
 
@@ -679,27 +778,45 @@ impl PdfWizardApp {
     }
 
     fn save_pdf_dialog(&mut self, pages: Vec<PageItem>, default_name: &str, booklet: bool) {
+        if self.busy.is_some() {
+            self.status = "Busy, please wait...".into();
+            return;
+        }
         let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(default_name).save_file()
         else {
             return;
         };
-        let result = if booklet {
-            pdf_engine::export_booklet(&pages, &self.sources, &self.meta)
-        } else {
-            pdf_engine::export_pages(&pages, &self.sources, &self.meta)
-        };
-        self.status = match result.and_then(|b| std::fs::write(&path, b).map_err(Into::into)) {
-            Ok(()) => format!("Saved {}", path.display()),
-            Err(e) => format!("Error: {e}"),
-        };
+        let sources = self.sources.clone();
+        let meta = self.meta.clone();
+        self.spawn_bg("Exporting PDF...", move || {
+            let result = if booklet {
+                pdf_engine::export_booklet(&pages, &sources, &meta)
+            } else {
+                pdf_engine::export_pages(&pages, &sources, &meta)
+            };
+            let msg = match result.and_then(|b| std::fs::write(&path, b).map_err(Into::into)) {
+                Ok(()) => format!("Saved {}", path.display()),
+                Err(e) => format!("Error: {e}"),
+            };
+            BgResult::Message(msg)
+        });
     }
 
     fn extract_to_folder(&mut self, pages: Vec<PageItem>) {
+        if self.busy.is_some() {
+            self.status = "Busy, please wait...".into();
+            return;
+        }
         let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
-        self.status = match pdf_engine::extract_separate(&pages, &self.sources, &dir, &self.meta) {
-            Ok(files) => format!("Wrote {} file(s) to {}", files.len(), dir.display()),
-            Err(e) => format!("Error: {e}"),
-        };
+        let sources = self.sources.clone();
+        let meta = self.meta.clone();
+        self.spawn_bg("Extracting pages...", move || {
+            let msg = match pdf_engine::extract_separate(&pages, &sources, &dir, &meta) {
+                Ok(files) => format!("Wrote {} file(s) to {}", files.len(), dir.display()),
+                Err(e) => format!("Error: {e}"),
+            };
+            BgResult::Message(msg)
+        });
     }
 
     fn apply_crop(&mut self) {
@@ -830,6 +947,11 @@ impl PdfWizardApp {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            if let Some(msg) = &self.busy {
+                ui.spinner();
+                ui.small(msg);
+                ui.separator();
+            }
             ui.small(format!(
                 "{} pages | {} source(s) | {}",
                 self.pages.len(),
@@ -1156,6 +1278,7 @@ fn mi(ui: &mut egui::Ui, a: &mut Vec<Action>, label: &str, shortcut: &str, act: 
 impl eframe::App for PdfWizardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_bg(&ctx);
         self.poll_thumbs(&ctx);
         let mut actions: Vec<Action> = Vec::new();
         self.handle_input(&ctx, &mut actions);
@@ -1328,6 +1451,27 @@ mod tests {
 
     #[test]
     fn card_touch_target_meets_36px_minimum() {
-        assert!(CARD_BTN_H >= 36.0);
+        const { assert!(CARD_BTN_H >= 36.0); }
+    }
+
+    #[test]
+    fn open_replace_clears_clipboard() {
+        let mut app = PdfWizardApp::empty();
+        let dir = std::env::temp_dir().join(format!("pdfwiz_clip_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("one.pdf");
+        let f2 = dir.join("two.pdf");
+        std::fs::write(&f1, pdf_engine::testutil::make_pdf(1)).unwrap();
+        std::fs::write(&f2, pdf_engine::testutil::make_pdf(1)).unwrap();
+
+        app.add_loaded(&[f1], true);
+        app.select_only(0);
+        let ctx = egui::Context::default();
+        app.run(Action::Copy, &ctx);
+        assert_eq!(app.clipboard.len(), 1);
+
+        app.add_loaded(&[f2], true);
+        assert!(app.clipboard.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

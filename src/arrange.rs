@@ -15,12 +15,12 @@ pub fn invert_selection(len: usize, sel: &[usize]) -> Vec<usize> {
     (0..len).filter(|i| !sel.contains(i)).collect()
 }
 
-pub fn reverse(pages: &mut Vec<PageItem>) {
+pub fn reverse(pages: &mut [PageItem]) {
     pages.reverse();
 }
 
 /// Swaps pages 1<->2, 3<->4, ...; a trailing odd page stays in place.
-pub fn swap_odd_even(pages: &mut Vec<PageItem>) {
+pub fn swap_odd_even(pages: &mut [PageItem]) {
     for pair in pages.chunks_exact_mut(2) {
         pair.swap(0, 1);
     }
@@ -46,7 +46,7 @@ pub fn move_pages(pages: &mut Vec<PageItem>, selected: &[usize], target: usize) 
 
 /// Shifts selected pages by 1 position left (`delta < 0`) or right (`delta > 0`),
 /// returning the updated sorted selected indices.
-pub fn step_move_pages(pages: &mut Vec<PageItem>, selected: &[usize], delta: isize) -> Vec<usize> {
+pub fn step_move_pages(pages: &mut [PageItem], selected: &[usize], delta: isize) -> Vec<usize> {
     let mut sel: Vec<usize> = selected.iter().copied().filter(|&i| i < pages.len()).collect();
     sel.sort_unstable();
     sel.dedup();
