@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::model::{Metadata, PageItem, SourceId};
+use crate::model::{CropMargins, Metadata, PageItem, SourceId};
 use anyhow::{anyhow, bail, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 use std::collections::HashMap;
@@ -116,6 +116,157 @@ fn pdf_text(s: &str) -> Object {
     }
 }
 
+fn box_of(doc: &Document, page: &Dictionary, key: &[u8]) -> Option<[f32; 4]> {
+    let v = resolve_numbers(doc, page.get(key).ok()?)?;
+    (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+}
+
+fn deref_dict(doc: &Document, obj: &Object) -> Dictionary {
+    match doc.dereference(obj) {
+        Ok((_, Object::Dictionary(d))) => d.clone(),
+        _ => Dictionary::new(),
+    }
+}
+
+fn num_array(b: [f32; 4]) -> Object {
+    Object::Array(b.iter().map(|&x| Object::Real(x)).collect())
+}
+
+/// Wraps a source page's content as a Form XObject in the destination document.
+fn make_form(src: &Document, dst: &mut Document, map: &mut IdMap, spid: ObjectId) -> ObjectId {
+    let content = src.get_page_content(spid);
+    let res = match inherited(src, spid, b"Resources") {
+        Some(r) => remap(src, dst, map, &r),
+        None => Object::Dictionary(Dictionary::new()),
+    };
+    let bbox = inherited(src, spid, b"MediaBox")
+        .and_then(|o| resolve_numbers(src, &o))
+        .filter(|v| v.len() == 4)
+        .map(|v| [v[0], v[1], v[2], v[3]])
+        .unwrap_or([0.0, 0.0, A4_W, A4_H]);
+    let dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Form",
+        "BBox" => num_array(bbox),
+        "Resources" => res,
+    };
+    dst.add_object(Stream::new(dict, content))
+}
+
+fn content_refs(dst: &Document, page: &Dictionary) -> Vec<Object> {
+    match page.get(b"Contents") {
+        Ok(Object::Reference(id)) => match dst.get_object(*id) {
+            Ok(Object::Array(a)) => a.clone(),
+            _ => vec![Object::Reference(*id)],
+        },
+        Ok(Object::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn stream_obj(dst: &mut Document, text: String) -> Object {
+    Object::Reference(dst.add_object(Stream::new(Dictionary::new(), text.into_bytes())))
+}
+
+/// Applies crop, scale and overlays to a page dictionary already copied into the destination document.
+fn apply_transforms(
+    dst: &mut Document,
+    page: &mut Dictionary,
+    item: &PageItem,
+    sources: &HashMap<SourceId, SourceDocument>,
+    maps: &mut HashMap<SourceId, IdMap>,
+) -> Result<()> {
+    let mut mb = box_of(dst, page, b"MediaBox").unwrap_or([0.0, 0.0, item.width_pt, item.height_pt]);
+    let mut cb = box_of(dst, page, b"CropBox");
+    let c = item.crop;
+    if c != CropMargins::default() {
+        let base = cb.unwrap_or(mb);
+        let (w, h) = (mb[2] - mb[0], mb[3] - mb[1]);
+        cb = Some([base[0] + c.left * w, base[1] + c.bottom * h, base[2] - c.right * w, base[3] - c.top * h]);
+    }
+    let scaled = (item.scale - 1.0).abs() > f32::EPSILON;
+    if scaled {
+        let s = item.scale;
+        mb = mb.map(|v| v * s);
+        cb = cb.map(|b| b.map(|v| v * s));
+    }
+    page.set("MediaBox", num_array(mb));
+    if let Some(cb) = cb {
+        page.set("CropBox", num_array(cb));
+    }
+    if !scaled && item.overlays.is_empty() {
+        return Ok(());
+    }
+
+    // Inline the resources so adding overlay XObjects never touches resources shared with other pages.
+    let mut res = page.get(b"Resources").map(|r| deref_dict(dst, r)).unwrap_or_default();
+    let mut xobjs = res.get(b"XObject").map(|x| deref_dict(dst, x)).unwrap_or_default();
+    let (mut under, mut over) = (Vec::new(), Vec::new());
+    for (i, ov) in item.overlays.iter().enumerate() {
+        let sd = sources.get(&ov.source_id).ok_or_else(|| anyhow!("missing overlay source {}", ov.source_id))?;
+        let &spid = sd
+            .doc
+            .get_pages()
+            .get(&ov.page_number)
+            .ok_or_else(|| anyhow!("{}: overlay page {} not found", sd.file_name, ov.page_number))?;
+        let map = maps.entry(ov.source_id).or_default();
+        let form = make_form(&sd.doc, dst, map, spid);
+        let name = format!("WzOv{i}");
+        xobjs.set(name.clone(), Object::Reference(form));
+        let s = stream_obj(dst, format!("q /{name} Do Q"));
+        if ov.is_underlay { under.push(s) } else { over.push(s) }
+    }
+    if !xobjs.is_empty() {
+        res.set("XObject", xobjs);
+    }
+    page.set("Resources", res);
+
+    let mut contents = Vec::new();
+    if scaled {
+        let s = item.scale;
+        contents.push(stream_obj(dst, format!("q {s} 0 0 {s} 0 0 cm")));
+    }
+    contents.extend(under);
+    contents.push(stream_obj(dst, "q".into()));
+    contents.extend(content_refs(dst, page));
+    contents.push(stream_obj(dst, "Q".into()));
+    contents.extend(over);
+    if scaled {
+        contents.push(stream_obj(dst, "Q".into()));
+    }
+    page.set("Contents", Object::Array(contents));
+    Ok(())
+}
+
+fn finish_document(mut dst: Document, pages_id: ObjectId, kids: Vec<Object>, meta: &Metadata) -> Result<Vec<u8>> {
+    let count = kids.len() as i64;
+    dst.objects.insert(
+        pages_id,
+        dictionary! {"Type" => "Pages", "Kids" => kids, "Count" => count}.into(),
+    );
+    let catalog = dst.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages_id});
+    dst.trailer.set("Root", catalog);
+
+    let mut info = Dictionary::new();
+    info.set("Producer", Object::string_literal("PDF Wizard"));
+    for (k, v) in [
+        ("Title", &meta.title),
+        ("Author", &meta.author),
+        ("Subject", &meta.subject),
+        ("Keywords", &meta.keywords),
+    ] {
+        if !v.is_empty() {
+            info.set(k, pdf_text(v));
+        }
+    }
+    let info_id = dst.add_object(info);
+    dst.trailer.set("Info", info_id);
+
+    let mut out = Vec::new();
+    dst.save_to(&mut out)?;
+    Ok(out)
+}
+
 pub fn export_pages(
     pages: &[PageItem],
     sources: &HashMap<SourceId, SourceDocument>,
@@ -166,7 +317,7 @@ pub fn export_pages(
                     page.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
                 }
                 if let Some(r) = inherited(src, spid, b"Rotate") {
-                    if let Some((_, r)) = src.dereference(&r).ok() {
+                    if let Ok((_, r)) = src.dereference(&r) {
                         rotate = r.as_i64().unwrap_or(0);
                     }
                 }
@@ -176,35 +327,124 @@ pub fn export_pages(
         if total != 0 {
             page.set("Rotate", total);
         }
+        apply_transforms(&mut dst, &mut page, item, sources, &mut maps)?;
         kids.push(Object::Reference(dst.add_object(page)));
     }
+    finish_document(dst, pages_id, kids, meta)
+}
 
-    let count = kids.len() as i64;
-    dst.objects.insert(
-        pages_id,
-        dictionary! {"Type" => "Pages", "Kids" => kids, "Count" => count}.into(),
-    );
-    let catalog = dst.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages_id});
-    dst.trailer.set("Root", catalog);
+pub const A4_W: f32 = 595.0;
+pub const A4_H: f32 = 842.0;
 
-    let mut info = Dictionary::new();
-    info.set("Producer", Object::string_literal("PDF Wizard"));
-    for (k, v) in [
-        ("Title", &meta.title),
-        ("Author", &meta.author),
-        ("Subject", &meta.subject),
-        ("Keywords", &meta.keywords),
-    ] {
-        if !v.is_empty() {
-            info.set(k, pdf_text(v));
+pub fn blank_page(uid: u64, w: f32, h: f32) -> PageItem {
+    PageItem::blank(uid, w, h)
+}
+
+/// Turns an image (PNG/JPEG/WEBP) into a one-page source document, scaled down to fit A4 if larger.
+pub fn image_to_source(id: SourceId, file_name: &str, bytes: &[u8]) -> Result<SourceDocument> {
+    let img = image::load_from_memory(bytes).map_err(|e| anyhow!("{file_name}: cannot read image ({e})"))?;
+    let (pw, ph) = (img.width(), img.height());
+    let jpeg_passthrough = image::guess_format(bytes).ok() == Some(image::ImageFormat::Jpeg)
+        && matches!(img.color(), image::ColorType::Rgb8 | image::ColorType::L8);
+
+    let mut dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => pw as i64,
+        "Height" => ph as i64,
+        "BitsPerComponent" => 8,
+    };
+    let mut stream = if jpeg_passthrough {
+        let gray = img.color() == image::ColorType::L8;
+        dict.set("ColorSpace", if gray { "DeviceGray" } else { "DeviceRGB" });
+        dict.set("Filter", "DCTDecode");
+        Stream::new(dict, bytes.to_vec())
+    } else {
+        // Composite any transparency over white; PDF image data is plain RGB.
+        let mut raw = Vec::with_capacity((pw * ph * 3) as usize);
+        for px in img.to_rgba8().pixels() {
+            let a = px[3] as u32;
+            for c in 0..3 {
+                raw.push(((px[c] as u32 * a + 255 * (255 - a)) / 255) as u8);
+            }
         }
+        dict.set("ColorSpace", "DeviceRGB");
+        Stream::new(dict, raw)
+    };
+    if !jpeg_passthrough {
+        stream.compress()?;
     }
-    let info_id = dst.add_object(info);
-    dst.trailer.set("Info", info_id);
 
-    let mut out = Vec::new();
-    dst.save_to(&mut out)?;
-    Ok(out)
+    let (lw, lh) = if pw >= ph { (A4_H, A4_W) } else { (A4_W, A4_H) };
+    let s = (lw / pw as f32).min(lh / ph as f32).min(1.0);
+    let (w, h) = (pw as f32 * s, ph as f32 * s);
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let img_id = doc.add_object(stream);
+    let content = doc.add_object(Stream::new(
+        Dictionary::new(),
+        format!("q {w} 0 0 {h} 0 0 cm /Im0 Do Q").into_bytes(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content,
+        "MediaBox" => num_array([0.0, 0.0, w, h]),
+        "Resources" => dictionary! {"XObject" => dictionary! {"Im0" => img_id}},
+    });
+    let out = finish_document(doc, pages_id, vec![Object::Reference(page)], &Metadata::default())?;
+    load_pdf(id, file_name, out)
+}
+
+/// Imposes pages 2-up on landscape sheets in saddle-stitch order.
+/// Known limitation: a page's /Rotate and CropBox are not honored in the imposed sheet.
+pub fn export_booklet(
+    pages: &[PageItem],
+    sources: &HashMap<SourceId, SourceDocument>,
+    meta: &Metadata,
+) -> Result<Vec<u8>> {
+    let flat = Document::load_mem(&export_pages(pages, sources, meta)?)?;
+    let ids: Vec<ObjectId> = flat.get_pages().values().copied().collect();
+    let size = |pid: ObjectId| {
+        flat.get_dictionary(pid)
+            .ok()
+            .and_then(|d| box_of(&flat, d, b"MediaBox"))
+            .map(|b| (b[2] - b[0], b[3] - b[1]))
+            .unwrap_or((A4_W, A4_H))
+    };
+    let slot_w = ids.iter().map(|&p| size(p).0).fold(0.0, f32::max);
+    let slot_h = ids.iter().map(|&p| size(p).1).fold(0.0, f32::max);
+
+    let mut dst = Document::with_version("1.5");
+    let pages_id = dst.new_object_id();
+    let mut map = IdMap::new();
+    let mut kids = Vec::new();
+    for sheet in crate::arrange::booklet_order(ids.len()).chunks(2) {
+        let mut xobjs = Dictionary::new();
+        let mut content = String::new();
+        for (slot, entry) in sheet.iter().enumerate() {
+            let Some(idx) = entry else { continue };
+            let pid = ids[*idx];
+            let (pw, ph) = size(pid);
+            let form = make_form(&flat, &mut dst, &mut map, pid);
+            let name = format!("Fm{slot}");
+            xobjs.set(name.clone(), Object::Reference(form));
+            let dx = slot as f32 * slot_w + (slot_w - pw) / 2.0;
+            let dy = (slot_h - ph) / 2.0;
+            content.push_str(&format!("q 1 0 0 1 {dx} {dy} cm /{name} Do Q\n"));
+        }
+        let cid = dst.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        let page = dst.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => cid,
+            "MediaBox" => num_array([0.0, 0.0, slot_w * 2.0, slot_h]),
+            "Resources" => dictionary! {"XObject" => xobjs},
+        });
+        kids.push(Object::Reference(page));
+    }
+    finish_document(dst, pages_id, kids, meta)
 }
 
 pub fn extract_separate(
@@ -387,5 +627,115 @@ mod tests {
             assert_eq!(Document::load(f).unwrap().get_pages().len(), 1);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+    fn boxf(d: &lopdf::Dictionary, key: &[u8]) -> Vec<f32> {
+        d.get(key).unwrap().as_array().unwrap().iter().map(|o| o.as_float().unwrap()).collect()
+    }
+    fn out_page(out: &[u8], n: u32) -> (Document, lopdf::ObjectId) {
+        let doc = Document::load_mem(out).unwrap();
+        let id = *doc.get_pages().get(&n).unwrap();
+        (doc, id)
+    }
+
+    #[test]
+    fn export_crop_sets_cropbox() {
+        let src = sources(make_pdf(1), "a.pdf");
+        let mut it = item(1, 1);
+        it.crop.left = 0.1;
+        it.crop.top = 0.25;
+        let out = export_pages(&[it], &src, &Metadata::default()).unwrap();
+        let (doc, id) = out_page(&out, 1);
+        let cb = boxf(doc.get_dictionary(id).unwrap(), b"CropBox");
+        assert!((cb[0] - 59.5).abs() < 0.01);
+        assert!((cb[3] - 631.5).abs() < 0.01);
+        assert!((cb[2] - 595.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn export_scale_scales_boxes_and_wraps_content() {
+        let src = sources(make_pdf(1), "a.pdf");
+        let mut it = item(1, 1);
+        it.scale = 0.5;
+        let out = export_pages(&[it], &src, &Metadata::default()).unwrap();
+        let (doc, id) = out_page(&out, 1);
+        let mb = boxf(doc.get_dictionary(id).unwrap(), b"MediaBox");
+        assert!((mb[2] - 297.5).abs() < 0.01 && (mb[3] - 421.0).abs() < 0.01);
+        let t = page_text(&doc, 1);
+        assert!(t.contains("0.5 0 0 0.5 0 0 cm") && t.contains("P1"));
+    }
+
+    #[test]
+    fn export_blank_page_has_a4_size() {
+        let src = sources(make_pdf(1), "a.pdf");
+        let b = blank_page(9, A4_W, A4_H);
+        let out = export_pages(&[b], &src, &Metadata::default()).unwrap();
+        let (doc, id) = out_page(&out, 1);
+        assert_eq!(boxf(doc.get_dictionary(id).unwrap(), b"MediaBox"), vec![0.0, 0.0, 595.0, 842.0]);
+    }
+
+    #[test]
+    fn export_overlay_adds_xobject_and_orders_content() {
+        let src = sources(make_pdf(2), "a.pdf");
+        for underlay in [false, true] {
+            let mut it = item(1, 1);
+            it.overlays.push(crate::model::OverlaySpec { source_id: 0, page_number: 2, is_underlay: underlay });
+            let out = export_pages(&[it], &src, &Metadata::default()).unwrap();
+            let (doc, id) = out_page(&out, 1);
+            let (res, _) = doc.get_page_resources(id).unwrap();
+            let xo = res.unwrap().get(b"XObject").unwrap().as_dict().unwrap();
+            assert!(!xo.is_empty());
+            let t = page_text(&doc, 1);
+            let (d, p) = (t.find("Do").unwrap(), t.find("P1").unwrap());
+            assert_eq!(d < p, underlay, "underlay={underlay}: {t}");
+        }
+    }
+
+    #[test]
+    fn export_overlay_does_not_leak_into_shared_resources() {
+        let src = sources(make_pdf(2), "a.pdf");
+        let mut with = item(1, 1);
+        with.overlays.push(crate::model::OverlaySpec { source_id: 0, page_number: 2, is_underlay: false });
+        let out = export_pages(&[with, item(2, 1)], &src, &Metadata::default()).unwrap();
+        let (doc, id) = out_page(&out, 2);
+        let (res, _) = doc.get_page_resources(id).unwrap();
+        assert!(res.map_or(true, |r| !r.has(b"XObject")));
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(w, h).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn image_import_creates_single_page() {
+        let s = image_to_source(5, "pic.png", &png(100, 50)).unwrap();
+        assert_eq!((s.page_count, page_size(&s, 1)), (1, (100.0, 50.0)));
+        let m = HashMap::from([(5, s)]);
+        let it = PageItem::from_source(1, 5, 1, 100.0, 50.0, "x".into());
+        let out = export_pages(&[it], &m, &Metadata::default()).unwrap();
+        assert!(page_text(&Document::load_mem(&out).unwrap(), 1).contains("Do"));
+    }
+
+    #[test]
+    fn image_import_large_fits_a4_landscape() {
+        let s = image_to_source(5, "big.png", &png(2000, 1000)).unwrap();
+        let (w, h) = page_size(&s, 1);
+        assert!(w <= 842.0 + 0.01 && h <= 595.0 + 0.01 && (w / h - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn image_import_rejects_garbage() {
+        assert!(image_to_source(5, "x.png", b"nope").is_err());
+    }
+
+    #[test]
+    fn booklet_has_half_as_many_double_width_sheets() {
+        let src = sources(make_pdf(6), "a.pdf");
+        let pages: Vec<PageItem> = (1..=6).map(|n| item(n as u64, n)).collect();
+        let out = export_booklet(&pages, &src, &Metadata::default()).unwrap();
+        let (doc, id) = out_page(&out, 1);
+        assert_eq!(doc.get_pages().len(), 4);
+        assert_eq!(boxf(doc.get_dictionary(id).unwrap(), b"MediaBox"), vec![0.0, 0.0, 1190.0, 842.0]);
     }
 }
