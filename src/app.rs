@@ -9,7 +9,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const THUMB_PX: u32 = 360;
-const SPACING: f32 = 10.0;
+const SPACING: f32 = 14.0;
+const TOUCH_HEIGHT: f32 = 44.0;
+
+/// Configures generous spacing, hit targets, and scrollbars for touchscreen use.
+pub fn apply_touch_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|s| {
+        s.spacing.interact_size = Vec2::new(TOUCH_HEIGHT, TOUCH_HEIGHT);
+        s.spacing.button_padding = Vec2::new(14.0, 10.0);
+        s.spacing.item_spacing = Vec2::new(10.0, 10.0);
+        s.spacing.slider_width = 180.0;
+        s.spacing.slider_rail_height = 14.0;
+        s.spacing.scroll.bar_width = 14.0;
+        s.spacing.scroll.handle_min_length = TOUCH_HEIGHT;
+    });
+}
 
 /// Number of thumbnail columns that fit in `avail_width` (at least 1).
 pub fn grid_columns(avail_width: f32, thumb: f32, spacing: f32) -> usize {
@@ -67,6 +81,10 @@ enum Action {
     ZoomOut,
     ZoomReset,
     ToggleTheme,
+    StepLeft,
+    StepRight,
+    ToggleSelectMode,
+    ToggleReorderMode,
 }
 
 pub struct PdfWizardApp {
@@ -82,6 +100,8 @@ pub struct PdfWizardApp {
     thumbs: HashMap<(SourceId, u32), Thumb>,
     zoom: f32,
     dark: bool,
+    select_mode: bool,
+    reorder_mode: bool,
     status: String,
     meta: Metadata,
     show_meta: bool,
@@ -109,9 +129,11 @@ impl PdfWizardApp {
             clipboard: Vec::new(),
             renderer: Renderer::new(),
             thumbs: HashMap::new(),
-            zoom: 160.0,
+            zoom: 190.0,
             dark: true,
-            status: "Ready. Open or drop PDF files to begin.".into(),
+            select_mode: false,
+            reorder_mode: false,
+            status: "Ready. Tap Open or drop PDF files to begin.".into(),
             meta: Metadata::default(),
             show_meta: false,
             show_crop: false,
@@ -124,6 +146,7 @@ impl PdfWizardApp {
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        apply_touch_style(&cc.egui_ctx);
         let mut app = Self::empty();
         let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
         if !args.is_empty() {
@@ -165,11 +188,21 @@ impl PdfWizardApp {
         }
     }
 
+    fn toggle_select(&mut self, i: usize) {
+        if i >= self.pages.len() {
+            return;
+        }
+        if !self.selected.remove(&i) {
+            self.selected.insert(i);
+        }
+        self.anchor = Some(i);
+    }
+
     fn handle_card_click(&mut self, i: usize, shift: bool, command: bool) {
         if i >= self.pages.len() {
             return;
         }
-        match (shift, command, self.anchor) {
+        match (shift, command || self.select_mode, self.anchor) {
             (true, _, Some(anchor)) => {
                 let max_idx = self.pages.len().saturating_sub(1);
                 self.selected = apply_range_select(anchor.min(max_idx), i)
@@ -177,12 +210,7 @@ impl PdfWizardApp {
                     .filter(|&idx| idx < self.pages.len())
                     .collect();
             }
-            (_, true, _) => {
-                if !self.selected.remove(&i) {
-                    self.selected.insert(i);
-                }
-                self.anchor = Some(i);
-            }
+            (_, true, _) => self.toggle_select(i),
             _ => self.select_only(i),
         }
     }
@@ -538,10 +566,29 @@ impl PdfWizardApp {
             }
             Action::ZoomIn => self.zoom = (self.zoom * 1.2).min(400.0),
             Action::ZoomOut => self.zoom = (self.zoom / 1.2).max(80.0),
-            Action::ZoomReset => self.zoom = 160.0,
+            Action::ZoomReset => self.zoom = 190.0,
             Action::ToggleTheme => {
                 self.dark = !self.dark;
                 ctx.set_visuals(if self.dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                apply_touch_style(ctx);
+            }
+            Action::StepLeft => self.step_move_selected(-1),
+            Action::StepRight => self.step_move_selected(1),
+            Action::ToggleSelectMode => {
+                self.select_mode = !self.select_mode;
+                self.status = if self.select_mode {
+                    "Select mode ON: tap cards to multi-select".into()
+                } else {
+                    "Select mode OFF".into()
+                };
+            }
+            Action::ToggleReorderMode => {
+                self.reorder_mode = !self.reorder_mode;
+                self.status = if self.reorder_mode {
+                    "Reorder mode ON: drag any card to move".into()
+                } else {
+                    "Reorder mode OFF: drag ⋮⋮ handle to move, swipe cards to scroll".into()
+                };
             }
         }
     }
@@ -662,109 +709,137 @@ impl PdfWizardApp {
         self.status = "Moved pages".into();
     }
 
+    fn step_move_selected(&mut self, delta: isize) {
+        if self.selected.is_empty() {
+            self.status = "No pages selected".into();
+            return;
+        }
+        let sel = self.sel_vec();
+        let mut pages = self.pages.clone();
+        let new_sel = arrange::step_move_pages(&mut pages, &sel, delta);
+        let unchanged = pages.iter().map(|p| p.uid).eq(self.pages.iter().map(|p| p.uid));
+        if unchanged {
+            return;
+        }
+        self.selected = new_sel.into_iter().collect();
+        self.anchor = self.selected.iter().next().copied();
+        self.pages = pages;
+        self.history.push(self.pages.clone());
+        self.status = if delta < 0 { "Moved left" } else { "Moved right" }.into();
+    }
+
     // -------------------------------------------------------------------- UI
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                mi(ui, a, "Open...", "Ctrl+O", Action::Open);
-                mi(ui, a, "Append PDF(s)...", "", Action::Append);
-                mi(ui, a, "Import Image(s)...", "", Action::ImportImages);
-                ui.separator();
-                mi(ui, a, "Save As...", "Ctrl+S", Action::Save);
-                mi(ui, a, "Extract Selected to Single PDF...", "", Action::ExtractSingle);
-                mi(ui, a, "Extract Selected to Separate PDFs...", "", Action::ExtractSeparate);
-                mi(ui, a, "Split All Pages to Folder...", "", Action::SplitAll);
-                mi(ui, a, "Generate Booklet...", "", Action::Booklet);
-                ui.separator();
-                mi(ui, a, "Edit Metadata...", "", Action::Metadata);
-                mi(ui, a, "Quit", "", Action::Quit);
-            });
-            ui.menu_button("Edit", |ui| {
-                mi(ui, a, "Undo", "Ctrl+Z", Action::Undo);
-                mi(ui, a, "Redo", "Ctrl+Y", Action::Redo);
-                ui.separator();
-                mi(ui, a, "Cut", "Ctrl+X", Action::Cut);
-                mi(ui, a, "Copy", "Ctrl+C", Action::Copy);
-                mi(ui, a, "Paste After", "Ctrl+V", Action::PasteAfter);
-                mi(ui, a, "Paste as Overlay", "", Action::PasteOverlay);
-                mi(ui, a, "Paste as Underlay", "", Action::PasteUnderlay);
-                ui.separator();
-                mi(ui, a, "Duplicate", "Ctrl+D", Action::Duplicate);
-                mi(ui, a, "Delete", "Del", Action::Delete);
-                mi(ui, a, "Insert Blank Page", "", Action::InsertBlank);
-            });
-            ui.menu_button("Select", |ui| {
-                mi(ui, a, "Select All", "Ctrl+A", Action::SelectAll);
-                mi(ui, a, "Deselect All", "", Action::SelectNone);
-                mi(ui, a, "Invert Selection", "", Action::Invert);
-                mi(ui, a, "Select Odd Pages", "", Action::SelectOdd);
-                mi(ui, a, "Select Even Pages", "", Action::SelectEven);
-                mi(ui, a, "Select Same Source", "", Action::SelectSame);
-            });
-            ui.menu_button("Arrange", |ui| {
-                mi(ui, a, "Rotate Left", "", Action::RotateLeft);
-                mi(ui, a, "Rotate Right", "", Action::RotateRight);
-                mi(ui, a, "Rotate 180", "", Action::Rotate180);
-                mi(ui, a, "Crop and Scale...", "", Action::CropDialog);
-                ui.separator();
-                mi(ui, a, "Reverse Order", "", Action::Reverse);
-                mi(ui, a, "Swap Odd/Even Pages", "", Action::SwapOddEven);
-            });
-            ui.menu_button("View", |ui| {
-                mi(ui, a, "Zoom In", "Ctrl++", Action::ZoomIn);
-                mi(ui, a, "Zoom Out", "Ctrl+-", Action::ZoomOut);
-                mi(ui, a, "Reset Zoom", "Ctrl+0", Action::ZoomReset);
-                mi(ui, a, "Toggle Dark/Light Theme", "", Action::ToggleTheme);
+    fn top_bar(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        ui.horizontal_wrapped(|ui| {
+            touch_btn(ui, true, "+ Open", false, || a.push(Action::Open));
+            touch_btn(ui, true, "Append", false, || a.push(Action::Append));
+            ui.separator();
+            touch_btn(ui, true, "Undo", false, || a.push(Action::Undo));
+            touch_btn(ui, true, "Redo", false, || a.push(Action::Redo));
+            ui.separator();
+            touch_btn(ui, true, "Select", self.select_mode, || a.push(Action::ToggleSelectMode));
+            touch_btn(ui, true, "Reorder", self.reorder_mode, || a.push(Action::ToggleReorderMode));
+            ui.separator();
+            touch_btn(ui, !self.pages.is_empty(), "Save", false, || a.push(Action::Save));
+            ui.menu_button("More", |ui| {
+                egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                    ui.label("Files & Pages");
+                    mi(ui, a, "Import Image(s)...", "", Action::ImportImages);
+                    mi(ui, a, "Insert Blank Page", "", Action::InsertBlank);
+                    mi(ui, a, "Split All Pages to Folder...", "", Action::SplitAll);
+                    mi(ui, a, "Generate Booklet...", "", Action::Booklet);
+                    mi(ui, a, "Edit Metadata...", "", Action::Metadata);
+                    ui.separator();
+                    ui.label("Selection");
+                    mi(ui, a, "Select All", "Ctrl+A", Action::SelectAll);
+                    mi(ui, a, "Deselect All", "", Action::SelectNone);
+                    mi(ui, a, "Invert Selection", "", Action::Invert);
+                    mi(ui, a, "Select Odd Pages", "", Action::SelectOdd);
+                    mi(ui, a, "Select Even Pages", "", Action::SelectEven);
+                    mi(ui, a, "Select Same Source", "", Action::SelectSame);
+                    ui.separator();
+                    ui.label("Clipboard & Arrange");
+                    mi(ui, a, "Copy", "Ctrl+C", Action::Copy);
+                    mi(ui, a, "Cut", "Ctrl+X", Action::Cut);
+                    mi(ui, a, "Paste After", "Ctrl+V", Action::PasteAfter);
+                    mi(ui, a, "Paste as Overlay", "", Action::PasteOverlay);
+                    mi(ui, a, "Paste as Underlay", "", Action::PasteUnderlay);
+                    mi(ui, a, "Rotate 180", "", Action::Rotate180);
+                    mi(ui, a, "Reverse Order", "", Action::Reverse);
+                    mi(ui, a, "Swap Odd/Even Pages", "", Action::SwapOddEven);
+                    ui.separator();
+                    ui.label("Zoom & Theme");
+                    ui.horizontal(|ui| {
+                        touch_btn(ui, true, " - ", false, || a.push(Action::ZoomOut));
+                        touch_btn(ui, true, "Reset", false, || a.push(Action::ZoomReset));
+                        touch_btn(ui, true, " + ", false, || a.push(Action::ZoomIn));
+                    });
+                    ui.add(egui::Slider::new(&mut self.zoom, 80.0..=400.0).show_value(false));
+                    let theme_lbl = if self.dark { "Switch to Light Theme" } else { "Switch to Dark Theme" };
+                    mi(ui, a, theme_lbl, "", Action::ToggleTheme);
+                    ui.separator();
+                    mi(ui, a, "Quit", "", Action::Quit);
+                });
             });
         });
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
-        let has_sel = !self.selected.is_empty();
+    fn selection_bar(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
+        let count = self.selected.len();
         ui.horizontal_wrapped(|ui| {
-            let mut b = |ui: &mut egui::Ui, enabled: bool, label: &str, act: Action| {
-                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                    a.push(act);
-                }
-            };
-            b(ui, true, "Open", Action::Open);
-            b(ui, !self.pages.is_empty(), "Save", Action::Save);
-            b(ui, has_sel, "Extract", Action::ExtractSingle);
+            ui.strong(format!("{count} sel"));
             ui.separator();
-            b(ui, true, "Undo", Action::Undo);
-            b(ui, true, "Redo", Action::Redo);
+            touch_btn(ui, true, "<", false, || a.push(Action::StepLeft));
+            touch_btn(ui, true, ">", false, || a.push(Action::StepRight));
             ui.separator();
-            b(ui, has_sel, "Rotate L", Action::RotateLeft);
-            b(ui, has_sel, "Rotate R", Action::RotateRight);
-            b(ui, has_sel, "Crop", Action::CropDialog);
-            b(ui, has_sel, "Duplicate", Action::Duplicate);
-            b(ui, has_sel, "Delete", Action::Delete);
-            b(ui, true, "Blank", Action::InsertBlank);
-            ui.separator();
-            ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.zoom, 80.0..=400.0).show_value(false));
+            touch_btn(ui, true, "Rotate L", false, || a.push(Action::RotateLeft));
+            touch_btn(ui, true, "Rotate R", false, || a.push(Action::RotateRight));
+            touch_btn(ui, true, "Crop", false, || a.push(Action::CropDialog));
+            touch_btn(ui, true, "Dup", false, || a.push(Action::Duplicate));
+            ui.menu_button("Extract", |ui| {
+                mi(ui, a, "Single PDF...", "", Action::ExtractSingle);
+                mi(ui, a, "Separate PDFs...", "", Action::ExtractSeparate);
+            });
+            touch_btn(ui, true, "Delete", false, || a.push(Action::Delete));
+            touch_btn(ui, true, "Clear", false, || a.push(Action::SelectNone));
         });
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
-        ui.label(format!(
-            "{} pages | {} selected | {} source(s) | {}",
-            self.pages.len(),
-            self.selected.len(),
-            self.sources.len(),
-            self.status
-        ));
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!(
+                "{} pages | {} source(s) | {}",
+                self.pages.len(),
+                self.sources.len(),
+                self.status
+            ));
+        });
     }
 
     fn grid(&mut self, ui: &mut egui::Ui, a: &mut Vec<Action>) {
         if self.pages.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label("Drop PDF or image files here, or use File > Open");
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.25).max(20.0));
+                ui.heading("PDF Wizard");
+                ui.add_space(8.0);
+                ui.label("Tap Open to choose PDF or image files, or drop files onto this window.");
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    let w = ui.available_width();
+                    let pad = ((w - 380.0) * 0.5).max(0.0);
+                    ui.add_space(pad);
+                    if ui.add_sized([200.0, 48.0], egui::Button::new("Open PDF or Images")).clicked() {
+                        a.push(Action::Open);
+                    }
+                    if ui.add_sized([165.0, 48.0], egui::Button::new("Insert Blank Page")).clicked() {
+                        a.push(Action::InsertBlank);
+                    }
+                });
             });
             return;
         }
-        let card = Vec2::new(self.zoom, self.zoom * 1.4 + 34.0);
+        let card = Vec2::new(self.zoom, self.zoom * 1.35 + 64.0);
         let cols = grid_columns(ui.available_width(), card.x, SPACING);
         self.drop_target = None;
         let n = self.pages.len();
@@ -791,20 +866,103 @@ impl PdfWizardApp {
 
     fn card(&mut self, ui: &mut egui::Ui, i: usize, size: Vec2, a: &mut Vec<Action>) {
         let item = self.pages[i].clone();
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let selected = self.selected.contains(&i);
+        let header_h = 38.0;
+        let footer_h = 24.0;
+        let btn_w = (size.x * 0.34).clamp(32.0, 40.0);
+
+        let check_rect = Rect::from_min_size(rect.min + Vec2::splat(4.0), Vec2::new(btn_w, header_h - 4.0));
+        let handle_rect = Rect::from_min_size(
+            egui::pos2(rect.right() - btn_w - 4.0, rect.top() + 4.0),
+            Vec2::new(btn_w, header_h - 4.0),
+        );
+        let body_rect = Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + header_h),
+            rect.max,
+        );
+        let title_rect = Rect::from_min_max(
+            egui::pos2(check_rect.right(), rect.top()),
+            egui::pos2(handle_rect.left(), rect.top() + header_h),
+        );
+
+        let check_resp = ui.interact(check_rect, ui.scope_id().with(("chk", item.uid, i)), Sense::click());
+        let handle_resp = ui.interact(handle_rect, ui.scope_id().with(("hdl", item.uid, i)), Sense::drag());
+        let title_resp = ui.interact(title_rect, ui.scope_id().with(("ttl", item.uid, i)), Sense::click());
+        let body_sense = if self.reorder_mode { Sense::click_and_drag() } else { Sense::click() };
+        let body_resp = ui.interact(body_rect, ui.scope_id().with(("bdy", item.uid, i)), body_sense);
 
         if ui.is_rect_visible(rect) {
             let thumb = item.source_id.map(|sid| self.ensure_thumb(sid, item.source_page_num));
             let painter = ui.painter_at(rect);
             let visuals = ui.visuals().clone();
             let bg = if selected { visuals.selection.bg_fill } else { visuals.faint_bg_color };
-            painter.rect_filled(rect, 6.0, bg);
+            painter.rect_filled(rect, 8.0, bg);
             if selected {
-                painter.rect_stroke(rect, 6.0, egui::Stroke::new(2.0, visuals.selection.stroke.color), egui::StrokeKind::Inside);
+                painter.rect_stroke(
+                    rect,
+                    8.0,
+                    egui::Stroke::new(2.5, visuals.selection.stroke.color),
+                    egui::StrokeKind::Inside,
+                );
             }
-            let area = Rect::from_min_max(rect.min + Vec2::splat(6.0), rect.max - Vec2::new(6.0, 34.0));
 
+            // Top-left touch checkbox
+            let chk_fill = if selected { visuals.selection.stroke.color } else { visuals.widgets.inactive.bg_fill };
+            painter.rect_filled(check_rect.shrink(3.0), 6.0, chk_fill);
+            painter.text(
+                check_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                if selected { "✓" } else { " " },
+                egui::FontId::proportional(16.0),
+                if selected { egui::Color32::WHITE } else { visuals.text_color() },
+            );
+            if !selected {
+                painter.rect_stroke(
+                    check_rect.shrink(3.0),
+                    6.0,
+                    egui::Stroke::new(1.5, visuals.widgets.inactive.fg_stroke.color),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            // Top-right touch drag handle
+            painter.rect_filled(handle_rect.shrink(3.0), 6.0, visuals.widgets.inactive.bg_fill);
+            painter.text(
+                handle_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⋮⋮",
+                egui::FontId::proportional(15.0),
+                visuals.text_color(),
+            );
+
+            // Top-center page number & transform tags
+            let mut tags = String::new();
+            if item.rotation != 0 {
+                tags += &format!(" R{}", item.rotation);
+            }
+            if item.crop != CropMargins::default() {
+                tags += " crop";
+            }
+            if (item.scale - 1.0).abs() > f32::EPSILON {
+                tags += &format!(" {:.0}%", item.scale * 100.0);
+            }
+            if !item.overlays.is_empty() {
+                tags += " ovl";
+            }
+            painter.text(
+                title_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("#{}{}", i + 1, tags),
+                egui::FontId::proportional(12.5),
+                visuals.text_color(),
+            );
+
+            // Thumbnail area
+            let area = Rect::from_min_max(
+                egui::pos2(rect.left() + 8.0, rect.top() + header_h + 2.0),
+                egui::pos2(rect.right() - 8.0, rect.bottom() - footer_h),
+            );
             let (bw, bh) = match &thumb {
                 Some(Thumb::Ready { w, h, .. }) => (*w, *h),
                 _ => (item.width_pt, item.height_pt),
@@ -842,49 +1000,30 @@ impl PdfWizardApp {
                 None => {}
             }
 
-            let mut tags = String::new();
-            if item.rotation != 0 {
-                tags += &format!(" R{}", item.rotation);
-            }
-            if item.crop != CropMargins::default() {
-                tags += " crop";
-            }
-            if (item.scale - 1.0).abs() > f32::EPSILON {
-                tags += &format!(" {:.0}%", item.scale * 100.0);
-            }
-            if !item.overlays.is_empty() {
-                tags += " ovl";
-            }
-            let text_color = visuals.text_color();
-            painter.text(
-                egui::pos2(rect.center().x, rect.bottom() - 26.0),
-                egui::Align2::CENTER_CENTER,
-                format!("#{}{}", i + 1, tags),
-                egui::FontId::proportional(12.0),
-                text_color,
-            );
             let max_chars = ((size.x / 6.5) as usize).max(8);
             let mut label: String = item.label.chars().take(max_chars).collect();
             if item.label.chars().count() > max_chars {
                 label.push('…');
             }
             painter.text(
-                egui::pos2(rect.center().x, rect.bottom() - 11.0),
+                egui::pos2(rect.center().x, rect.bottom() - footer_h * 0.5),
                 egui::Align2::CENTER_CENTER,
                 label,
-                egui::FontId::proportional(10.5),
+                egui::FontId::proportional(11.0),
                 visuals.weak_text_color(),
             );
         }
 
-        if resp.clicked() {
+        if check_resp.clicked() {
+            self.toggle_select(i);
+        } else if body_resp.clicked() || title_resp.clicked() {
             let m = ui.input(|inp| inp.modifiers);
             self.handle_card_click(i, m.shift, m.command);
         }
-        if resp.secondary_clicked() && !self.selected.contains(&i) {
+        if (body_resp.secondary_clicked() || title_resp.secondary_clicked()) && !self.selected.contains(&i) {
             self.select_only(i);
         }
-        if resp.drag_started() {
+        if handle_resp.drag_started() || (self.reorder_mode && body_resp.drag_started()) {
             if !self.selected.contains(&i) {
                 self.select_only(i);
             }
@@ -898,12 +1037,12 @@ impl PdfWizardApp {
                     let x = if before { rect.left() - SPACING / 2.0 } else { rect.right() + SPACING / 2.0 };
                     ui.painter().line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(3.0, ui.visuals().selection.stroke.color),
+                        egui::Stroke::new(3.5, ui.visuals().selection.stroke.color),
                     );
                 }
             }
         }
-        resp.context_menu(|ui| {
+        body_resp.context_menu(|ui| {
             mi(ui, a, "Rotate Left", "", Action::RotateLeft);
             mi(ui, a, "Rotate Right", "", Action::RotateRight);
             mi(ui, a, "Crop and Scale...", "", Action::CropDialog);
@@ -923,45 +1062,60 @@ impl PdfWizardApp {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let mut open = self.show_meta;
-        egui::Window::new("Document Metadata").open(&mut open).collapsible(false).show(ctx, |ui| {
-            egui::Grid::new("meta").num_columns(2).show(ui, |ui| {
-                for (label, field) in [
-                    ("Title", &mut self.meta.title),
-                    ("Author", &mut self.meta.author),
-                    ("Subject", &mut self.meta.subject),
-                    ("Keywords", &mut self.meta.keywords),
-                ] {
-                    ui.label(label);
-                    ui.text_edit_singleline(field);
-                    ui.end_row();
+        let mut close_meta = false;
+        egui::Window::new("Document Metadata")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("meta").num_columns(2).spacing([10.0, 12.0]).show(ui, |ui| {
+                    for (label, field) in [
+                        ("Title", &mut self.meta.title),
+                        ("Author", &mut self.meta.author),
+                        ("Subject", &mut self.meta.subject),
+                        ("Keywords", &mut self.meta.keywords),
+                    ] {
+                        ui.label(label);
+                        ui.add(egui::TextEdit::singleline(field).min_size(Vec2::new(220.0, 38.0)));
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label("Applied when saving or extracting.");
+                ui.add_space(8.0);
+                if ui.add_sized([120.0, TOUCH_HEIGHT], egui::Button::new("Done")).clicked() {
+                    close_meta = true;
                 }
             });
-            ui.label("Applied when saving or extracting.");
-        });
-        self.show_meta = open;
+        self.show_meta = open && !close_meta;
 
         let mut open = self.show_crop;
         let mut apply = false;
-        egui::Window::new("Crop and Scale").open(&mut open).collapsible(false).show(ctx, |ui| {
-            for (label, v) in [
-                ("Left %", 0),
-                ("Right %", 1),
-                ("Top %", 2),
-                ("Bottom %", 3),
-            ] {
-                ui.add(egui::Slider::new(&mut self.crop_edit[v], 0.0..=49.0).text(label));
-            }
-            ui.add(egui::Slider::new(&mut self.scale_edit, 10.0..=400.0).text("Scale %"));
-            ui.horizontal(|ui| {
-                if ui.button("Apply to selected").clicked() {
-                    apply = true;
+        egui::Window::new("Crop and Scale")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                for (label, v) in [
+                    ("Left %", 0),
+                    ("Right %", 1),
+                    ("Top %", 2),
+                    ("Bottom %", 3),
+                ] {
+                    ui.add(egui::Slider::new(&mut self.crop_edit[v], 0.0..=49.0).text(label));
                 }
-                if ui.button("Reset").clicked() {
-                    self.crop_edit = [0.0; 4];
-                    self.scale_edit = 100.0;
-                }
+                ui.add(egui::Slider::new(&mut self.scale_edit, 10.0..=400.0).text("Scale %"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_sized([160.0, TOUCH_HEIGHT], egui::Button::new("Apply to selected")).clicked() {
+                        apply = true;
+                    }
+                    if ui.add_sized([110.0, TOUCH_HEIGHT], egui::Button::new("Reset")).clicked() {
+                        self.crop_edit = [0.0; 4];
+                        self.scale_edit = 100.0;
+                    }
+                });
             });
-        });
         self.show_crop = open && !apply;
         if apply {
             self.apply_crop();
@@ -969,8 +1123,18 @@ impl PdfWizardApp {
     }
 }
 
+fn touch_btn(ui: &mut egui::Ui, enabled: bool, label: &str, active: bool, on_click: impl FnOnce()) {
+    let mut btn = egui::Button::new(label).min_size(Vec2::new(0.0, TOUCH_HEIGHT));
+    if active {
+        btn = btn.fill(ui.visuals().selection.bg_fill);
+    }
+    if ui.add_enabled(enabled, btn).clicked() {
+        on_click();
+    }
+}
+
 fn mi(ui: &mut egui::Ui, a: &mut Vec<Action>, label: &str, shortcut: &str, act: Action) {
-    let mut button = egui::Button::new(label);
+    let mut button = egui::Button::new(label).min_size(Vec2::new(220.0, 42.0));
     if !shortcut.is_empty() {
         button = button.shortcut_text(shortcut);
     }
@@ -986,9 +1150,11 @@ impl eframe::App for PdfWizardApp {
         self.poll_thumbs(&ctx);
         let mut actions: Vec<Action> = Vec::new();
         self.handle_input(&ctx, &mut actions);
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &mut actions));
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &mut actions));
+        egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui, &mut actions));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if !self.selected.is_empty() {
+            egui::Panel::bottom("selection_bar").show(ui, |ui| self.selection_bar(ui, &mut actions));
+        }
         egui::CentralPanel::default().show(ui, |ui| self.grid(ui, &mut actions));
         self.dialogs(&ctx);
         for action in actions {
@@ -1090,5 +1256,55 @@ mod tests {
         assert!(!app.sources.contains_key(&0));
         assert!(!app.thumbs.contains_key(&(0, 1)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn select_mode_toggles_without_modifiers() {
+        let mut app = PdfWizardApp::empty();
+        let pages: Vec<PageItem> = (0..4).map(|i| pdf_engine::blank_page(i, A4_W, A4_H)).collect();
+        app.commit(pages);
+        app.select_mode = true;
+        app.handle_card_click(0, false, false);
+        app.handle_card_click(2, false, false);
+        assert_eq!(app.sel_vec(), vec![0, 2]);
+        app.handle_card_click(0, false, false);
+        assert_eq!(app.sel_vec(), vec![2]);
+    }
+
+    #[test]
+    fn step_move_selected_updates_pages_and_selection() {
+        let mut app = PdfWizardApp::empty();
+        let pages: Vec<PageItem> = (1..=3).map(|i| pdf_engine::blank_page(i, A4_W, A4_H)).collect();
+        app.commit(pages);
+        app.select_only(1);
+        let ctx = egui::Context::default();
+        app.run(Action::StepLeft, &ctx);
+        assert_eq!(app.pages.iter().map(|p| p.uid).collect::<Vec<_>>(), vec![2, 1, 3]);
+        assert_eq!(app.sel_vec(), vec![0]);
+
+        app.run(Action::StepRight, &ctx);
+        assert_eq!(app.pages.iter().map(|p| p.uid).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(app.sel_vec(), vec![1]);
+    }
+
+    #[test]
+    fn step_move_at_start_does_not_push_history() {
+        let mut app = PdfWizardApp::empty();
+        let pages: Vec<PageItem> = (1..=3).map(|i| pdf_engine::blank_page(i, A4_W, A4_H)).collect();
+        app.pages = pages.clone();
+        app.history = History::new(pages);
+        app.select_only(0);
+        let ctx = egui::Context::default();
+        app.run(Action::StepLeft, &ctx);
+        assert!(app.history.undo().is_none());
+    }
+
+    #[test]
+    fn touch_style_sets_min_interact_size() {
+        let ctx = egui::Context::default();
+        apply_touch_style(&ctx);
+        let s = ctx.global_style();
+        assert!(s.spacing.interact_size.y >= 44.0);
+        assert!(s.spacing.scroll.bar_width >= 12.0);
     }
 }
