@@ -44,6 +44,38 @@ pub fn move_pages(pages: &mut Vec<PageItem>, selected: &[usize], target: usize) 
     }
 }
 
+/// Shifts selected pages by 1 position left (`delta < 0`) or right (`delta > 0`),
+/// returning the updated sorted selected indices.
+pub fn step_move_pages(pages: &mut Vec<PageItem>, selected: &[usize], delta: isize) -> Vec<usize> {
+    let mut sel: Vec<usize> = selected.iter().copied().filter(|&i| i < pages.len()).collect();
+    sel.sort_unstable();
+    sel.dedup();
+    if sel.is_empty() || delta == 0 {
+        return sel;
+    }
+    let mut out = std::collections::BTreeSet::new();
+    if delta < 0 {
+        for i in sel {
+            if i > 0 && !out.contains(&(i - 1)) {
+                pages.swap(i, i - 1);
+                out.insert(i - 1);
+            } else {
+                out.insert(i);
+            }
+        }
+    } else {
+        for i in sel.into_iter().rev() {
+            if i + 1 < pages.len() && !out.contains(&(i + 1)) {
+                pages.swap(i, i + 1);
+                out.insert(i + 1);
+            } else {
+                out.insert(i);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Saddle-stitch order over `n` pages padded to a multiple of 4.
 /// `None` is a blank padding page. Output is read in groups of 4 = one sheet (front: a,b; back: c,d).
 pub fn booklet_order(n: usize) -> Vec<Option<usize>> {
@@ -126,6 +158,35 @@ mod tests {
     #[test]
     fn booklet_order_4_is_one_sheet() {
         assert_eq!(booklet_order(4), vec![Some(3), Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn step_move_left_and_right() {
+        let mut p = list(5);
+        let sel = step_move_pages(&mut p, &[1, 2], -1);
+        assert_eq!(uids(&p), vec![1, 2, 0, 3, 4]);
+        assert_eq!(sel, vec![0, 1]);
+
+        let sel = step_move_pages(&mut p, &sel, 1);
+        assert_eq!(uids(&p), vec![0, 1, 2, 3, 4]);
+        assert_eq!(sel, vec![1, 2]);
+    }
+
+    #[test]
+    fn step_move_at_boundary_is_noop() {
+        let mut p = list(4);
+        assert_eq!(step_move_pages(&mut p, &[0, 1], -1), vec![0, 1]);
+        assert_eq!(uids(&p), vec![0, 1, 2, 3]);
+        assert_eq!(step_move_pages(&mut p, &[2, 3], 1), vec![2, 3]);
+        assert_eq!(uids(&p), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn step_move_non_contiguous_preserves_order() {
+        let mut p = list(5);
+        let sel = step_move_pages(&mut p, &[1, 3], -1);
+        assert_eq!(uids(&p), vec![1, 0, 3, 2, 4]);
+        assert_eq!(sel, vec![0, 2]);
     }
 }
 
