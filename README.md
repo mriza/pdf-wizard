@@ -21,6 +21,13 @@ cargo build --release
 
 Requires a recent stable Rust toolchain. The UI uses OpenGL (via `glow`), and the Linux build uses X11/Wayland at runtime (no GTK or other PDF libraries needed).
 
+## Interface
+
+- **Left bench** (collapsible with `Ctrl+B`): page counts, selection helpers, transform, page, and export actions. The classic menu bar holds less common actions.
+- **Add pages** appends to the current document. **Open and replace** (`Ctrl+Shift+O`) confirms before clearing the bench, undo history, and copied pages.
+- **Selection tray**: when pages are selected, a floating tray appears at the bottom of the canvas with move, rotate, crop, duplicate, export, and delete actions.
+- Drag any page card to reorder; click, `Ctrl`-click, or `Shift`-click to select. `F1` lists keyboard shortcuts.
+
 ## Usage
 
 ```bash

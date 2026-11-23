@@ -43,6 +43,14 @@ impl History {
     pub fn current(&self) -> &Vec<PageItem> {
         &self.stack[self.pos]
     }
+
+    pub fn can_undo(&self) -> bool {
+        self.pos > 0
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.pos + 1 < self.stack.len()
+    }
 }
 
 #[cfg(test)]
@@ -75,7 +83,23 @@ mod tests {
     #[test]
     fn undo_at_start_returns_none() {
         let mut h = History::new(list(1));
+        assert!(!h.can_undo());
+        assert!(!h.can_redo());
         assert!(h.undo().is_none());
+    }
+
+    #[test]
+    fn can_undo_and_redo_track_position() {
+        let mut h = History::new(list(1));
+        h.push(list(2));
+        assert!(h.can_undo());
+        assert!(!h.can_redo());
+        h.undo();
+        assert!(!h.can_undo());
+        assert!(h.can_redo());
+        h.redo();
+        assert!(h.can_undo());
+        assert!(!h.can_redo());
     }
 
     #[test]
